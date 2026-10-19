@@ -18,8 +18,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-sys.path.insert(0, os.path.dirname(__file__))
-
 playwright = pytest.importorskip("playwright.sync_api",
                                  reason="playwright niet geïnstalleerd")
 
@@ -80,15 +78,27 @@ def client(monkeypatch):
     if pad := os.environ.get("CHROMIUM_PATH"):
         monkeypatch.setenv("CHROMIUM_PATH", pad)
 
-    import importlib
-    import app as renderer_app
-    importlib.reload(renderer_app)
+    # Bewust via de bestandsnaam en niet via "import app": de brug heeft ook
+    # een app.py, en die staat in sys.modules zodra haar tests gedraaid zijn.
+    # Dan krijg je de verkeerde module en een onbegrijpelijke ValueError.
+    import importlib.util
+
+    pad = os.path.join(os.path.dirname(__file__), "renderer.py")
+    spec = importlib.util.spec_from_file_location("tandoor_renderer", pad)
+    renderer_app = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(renderer_app)
 
     flask_app = renderer_app.create_app()
     with flask_app.test_client() as http:
-        antwoord = http.get("/healthz")
-        if antwoord.status_code != 200:
+        if http.get("/healthz").status_code != 200:
             pytest.skip("browserthread kwam niet op")
+        # /healthz zegt alleen dat de thread leeft; de browser start pas bij
+        # het eerste verzoek. Dus hier echt proberen, en overslaan als
+        # Chromium op deze machine niet op te starten is.
+        proef = http.get("/fingerprint")
+        if proef.status_code != 200:
+            pytest.skip(f"Chromium start hier niet: "
+                        f"{proef.get_json().get('error', '?')[:120]}")
         yield http
 
 

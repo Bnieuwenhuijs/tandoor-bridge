@@ -11,7 +11,7 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py ./
+COPY renderer.py ./
 
 # --with-deps haalt de systeempakketten op die Chromium nodig heeft. Dit maakt
 # het image groot (~1,2 GB); dat is de prijs van een echte browser, en de reden
@@ -29,4 +29,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
 
 # Eén worker en één thread: de browserthread binnen dit proces bezit Playwright,
 # en de sync-API mag niet vanuit een andere thread gebruikt worden.
-CMD ["sh", "-c", "exec gunicorn --workers 1 --threads 1 --timeout 180 --bind 0.0.0.0:${PORT} --error-logfile - 'app:create_app()'"]
+CMD ["sh", "-c", "exec gunicorn --workers 1 --threads 1 --timeout 180 --bind 0.0.0.0:${PORT} --error-logfile - 'renderer:create_app()'"]
