@@ -7,6 +7,13 @@ services:
     # en zet in plaats daarvan: build: .
     container_name: tandoor-bridge
     restart: unless-stopped
+    # Haal het image elke start opnieuw op. Zonder dit ziet TrueNAS een
+    # verschoven :latest niet: de Update-knop kijkt naar de app-configuratie,
+    # en die verandert niet als alleen de tag naar een nieuw image wijst.
+    # Keerzijde: start de NAS op terwijl er geen internet is, dan mislukt de
+    # pull en start de container niet. Haal deze regel weg als je dat erger
+    # vindt dan handmatig bijwerken.
+    pull_policy: always
     env_file: .env
     ports:
       # Alleen op het LAN en via Tailscale, niet naar het internet

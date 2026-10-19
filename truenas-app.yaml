@@ -31,6 +31,13 @@ services:
     # update niets aan deze regel te veranderen.
     image: ghcr.io/bnieuwenhuijs/tandoor-bridge:latest
     restart: unless-stopped
+    # Haal het image elke start opnieuw op. Zonder dit ziet TrueNAS een
+    # verschoven :latest niet: de Update-knop kijkt naar de app-configuratie,
+    # en die verandert niet als alleen de tag naar een nieuw image wijst.
+    # Keerzijde: start de NAS op terwijl er geen internet is, dan mislukt de
+    # pull en start de container niet. Haal deze regel weg als je dat erger
+    # vindt dan handmatig bijwerken.
+    pull_policy: always
 
     # 568 is de apps-gebruiker van TrueNAS. De dataset bij volumes moet van
     # die gebruiker zijn, anders kan de brug z'n database niet aanmaken.
