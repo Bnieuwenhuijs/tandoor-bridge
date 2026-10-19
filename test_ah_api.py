@@ -6,6 +6,7 @@ Geen enkele test raakt api.ah.nl.
 
 import json
 import re
+import time
 
 import pytest
 
@@ -106,6 +107,13 @@ def test_recept_ophalen(ah):
     assert recept["ingredients"][0]["text"] == "600 g kipfilet"
     # In een rondje: alle velden bestaan, dus er is niets bij te stellen.
     assert len([r for r in gezien(ah) if r[0] == "graphql"]) == 1
+
+
+def test_een_verlopen_token_wordt_vernieuwd(ah):
+    # Zo ziet het eruit als het token onderweg verloopt: AH antwoordt met 401.
+    ah_api._token = ah_api._Token("van-gisteren", time.time() + 3600)
+    recept = ah_api.fetch_recipe(1194169, api_url=ah.url)
+    assert recept["title"].startswith("Traybake")
 
 
 def test_onbekend_recept(ah):

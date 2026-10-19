@@ -295,6 +295,19 @@ def reset_schema() -> None:
 
 def fetch_recipe(recipe_id: int, *, api_url: str | None = None, session=None) -> dict:
     """Het recept zoals AH het geeft. Gooit AhError met een leesbare reden."""
+    try:
+        return _fetch_recipe(recipe_id, api_url=api_url, session=session)
+    except AhError as e:
+        if e.status != 401:
+            raise
+        # Het token was toch verlopen. De brug draait weken achter elkaar, dus
+        # dit gebeurt een keer: nieuw token, en nog één poging.
+        log.info("AH wees het token af; nieuw token halen")
+        reset_token()
+        return _fetch_recipe(recipe_id, api_url=api_url, session=session)
+
+
+def _fetch_recipe(recipe_id: int, *, api_url: str | None = None, session=None) -> dict:
     global _stand
     api_url = (api_url or API_URL).rstrip("/")
     eigen = session or requests.Session()
