@@ -134,7 +134,11 @@ def image_headers(referer: str | None = None) -> dict:
     de eigen pagina lijkt te komen.
     """
     headers = dict(HEADERS)
-    headers["Accept"] = "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"
+    # Bewust geen avif: Tandoor keurt een upload op de bestandsnaam en
+    # is_file_type_allowed() laat alleen png, jpg, jpeg, gif en webp door
+    # (cookbook/helper/image_processing.py). Vragen we om avif, dan geeft een
+    # modern CDN dat ook, en loopt de upload daarna stuk op het formaat.
+    headers["Accept"] = "image/webp,image/png,image/jpeg,image/*;q=0.8"
     headers["Sec-Fetch-Dest"] = "image"
     headers["Sec-Fetch-Mode"] = "no-cors"
     headers["Sec-Fetch-Site"] = "same-site"
