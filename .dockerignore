@@ -1,0 +1,12 @@
+.git
+.github
+data/
+__pycache__/
+.pytest_cache/
+.venv/
+*.sqlite3
+.env
+test_*.py
+conftest.py
+fixtures/
+README.md

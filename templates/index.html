@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Tandoor Bridge</title>
+<style>
+:root {
+  --bg: #f6f6f4;
+  --card: #ffffff;
+  --tekst: #1c1c1a;
+  --zacht: #6b6b66;
+  --rand: #e3e3df;
+  --accent: #2f6f4f;
+  --accent-tekst: #ffffff;
+  --groen: #2f6f4f;
+  --rood: #a83232;
+  --amber: #96681a;
+  --blauw: #2b5d8a;
+  --radius: 12px;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #17181a;
+    --card: #1f2124;
+    --tekst: #e9e9e6;
+    --zacht: #9a9a95;
+    --rand: #313438;
+    --accent: #4d9b73;
+    --accent-tekst: #10120f;
+    --groen: #6fc096;
+    --rood: #e4857f;
+    --amber: #d8ab5e;
+    --blauw: #7fb2de;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  padding: 16px;
+  background: var(--bg);
+  color: var(--tekst);
+  font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  -webkit-text-size-adjust: 100%;
+}
+.wrap { max-width: 720px; margin: 0 auto; }
+header { margin: 8px 0 20px; }
+h1 { font-size: 22px; margin: 0 0 4px; letter-spacing: -0.01em; }
+.statusregel { color: var(--zacht); font-size: 14px; }
+.kaart {
+  background: var(--card);
+  border: 1px solid var(--rand);
+  border-radius: var(--radius);
+  padding: 16px;
+  margin-bottom: 16px;
+}
+h2 { font-size: 15px; margin: 0 0 12px; text-transform: uppercase;
+     letter-spacing: 0.06em; color: var(--zacht); font-weight: 600; }
+textarea {
+  width: 100%;
+  min-height: 120px;
+  padding: 12px;
+  border: 1px solid var(--rand);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--tekst);
+  font: inherit;
+  resize: vertical;
+}
+textarea:focus, button:focus-visible, input:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 2px;
+}
+.knoppen { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+button {
+  font: inherit;
+  font-weight: 500;
+  padding: 10px 16px;
+  border-radius: 8px;
+  border: 1px solid var(--rand);
+  background: var(--card);
+  color: var(--tekst);
+  cursor: pointer;
+  min-height: 44px;
+}
+button.primair { background: var(--accent); color: var(--accent-tekst); border-color: transparent; }
+button:disabled { opacity: 0.5; cursor: default; }
+button.klein { padding: 6px 10px; min-height: 36px; font-size: 14px; }
+.chips { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
+.chip {
+  padding: 6px 12px; border-radius: 999px; border: 1px solid var(--rand);
+  background: transparent; font-size: 14px; min-height: 36px;
+}
+.chip[aria-pressed="true"] { background: var(--accent); color: var(--accent-tekst); border-color: transparent; }
+ul { list-style: none; margin: 0; padding: 0; }
+li.regel {
+  display: flex; gap: 10px; align-items: flex-start;
+  padding: 12px 0; border-top: 1px solid var(--rand);
+}
+li.regel:first-child { border-top: none; }
+.regel .inhoud { flex: 1; min-width: 0; }
+.titel { font-weight: 500; overflow-wrap: anywhere; }
+.sub { color: var(--zacht); font-size: 13px; overflow-wrap: anywhere; margin-top: 2px; }
+.fout { color: var(--rood); font-size: 13px; margin-top: 2px; overflow-wrap: anywhere; }
+.badge {
+  font-size: 12px; font-weight: 600; padding: 3px 8px; border-radius: 6px;
+  border: 1px solid currentColor; white-space: nowrap; flex-shrink: 0;
+}
+.badge.klaar, .badge.nieuw { color: var(--groen); }
+.badge.mislukt, .badge.eerder_mislukt { color: var(--rood); }
+.badge.bestaat_al, .badge.al_geimporteerd { color: var(--amber); }
+.badge.wachtend, .badge.in_wachtrij { color: var(--zacht); }
+.badge.ophalen, .badge.naar_tandoor { color: var(--blauw); }
+a { color: var(--accent); }
+.leeg { color: var(--zacht); padding: 12px 0; }
+.melding {
+  padding: 10px 12px; border-radius: 8px; margin-top: 12px; font-size: 14px;
+  border: 1px solid var(--rand); background: var(--bg);
+}
+.melding.fout { color: var(--rood); }
+input[type=file] { font: inherit; max-width: 100%; }
+.rij { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>Tandoor Bridge</h1>
+  <div class="statusregel" id="statusregel" aria-live="polite">bezig met laden…</div>
+</header>
+
+<section class="kaart">
+  <h2>Recepten importeren</h2>
+  <label for="invoer" class="sub" style="display:block;margin-bottom:8px">
+    Plak een WhatsApp-bericht, een hele chat-export of losse links — één per regel mag ook.
+  </label>
+  <textarea id="invoer" placeholder="Lieke: deze moeten we maken! https://www.ah.nl/allerhande/recept/…"></textarea>
+  <div class="knoppen">
+    <button id="bekijk">Bekijk wat erin zit</button>
+    <button id="importeer" class="primair">Importeren</button>
+  </div>
+  <div id="invoermelding"></div>
+</section>
+
+<section class="kaart" id="voorbeeldkaart" hidden>
+  <div class="rij">
+    <h2 style="margin:0">Gevonden links</h2>
+    <button id="importeervoorbeeld" class="primair klein">Importeer deze</button>
+  </div>
+  <ul id="voorbeeld" style="margin-top:12px"></ul>
+</section>
+
+<section class="kaart">
+  <h2>Lijst uit een bestand</h2>
+  <div class="knoppen" style="margin-top:0">
+    <input type="file" id="bestand" accept=".txt,text/plain">
+    <button id="uploadknop">Toevoegen</button>
+  </div>
+  <div id="bestandmelding"></div>
+</section>
+
+<section class="kaart">
+  <div class="rij" style="margin-bottom:12px">
+    <h2 style="margin:0">Geschiedenis</h2>
+    <button id="opnieuwalles" class="klein" hidden>Alle mislukte opnieuw</button>
+  </div>
+  <div class="chips" id="filters" role="group" aria-label="Filter op status"></div>
+  <ul id="lijst"></ul>
+</section>
+
+</div>
+
+<script>
+"use strict";
+
+// De statussen zoals ze in de interface heten.
+const LABELS = {
+  wachtend: "Wachtend", ophalen: "Ophalen", naar_tandoor: "Naar Tandoor",
+  klaar: "Klaar", mislukt: "Mislukt", bestaat_al: "Bestaat al",
+  nieuw: "Nieuw", al_geimporteerd: "Al geïmporteerd",
+  in_wachtrij: "In de wachtrij", eerder_mislukt: "Eerder mislukt",
+};
+const FILTERS = [
+  ["", "Alles"], ["mislukt", "Mislukt"], ["klaar", "Klaar"],
+  ["wachtend", "Wachtend"], ["bestaat_al", "Bestaat al"],
+];
+// Zolang hier iets in staat, is er werk onderweg en verversen we vaker.
+const ONDERWEG = ["wachtend", "ophalen", "naar_tandoor"];
+
+let filter = "";
+let timer = null;
+
+const $ = (id) => document.getElementById(id);
+
+function el(tag, klasse, tekst) {
+  const node = document.createElement(tag);
+  if (klasse) node.className = klasse;
+  // Altijd textContent: een recepttitel komt van een vreemde website.
+  if (tekst !== undefined) node.textContent = tekst;
+  return node;
+}
+
+function badge(status) {
+  return el("span", "badge " + status, LABELS[status] || status);
+}
+
+function melding(doel, tekst, isFout) {
+  const vak = $(doel);
+  vak.innerHTML = "";
+  if (!tekst) return;
+  vak.appendChild(el("div", "melding" + (isFout ? " fout" : ""), tekst));
+}
+
+function tijd(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (isNaN(d)) return "";
+  return d.toLocaleString("nl-NL", { day: "numeric", month: "short",
+                                     hour: "2-digit", minute: "2-digit" });
+}
+
+async function vraag(pad, opties) {
+  const antwoord = await fetch(pad, opties);
+  let data = {};
+  try { data = await antwoord.json(); } catch (e) { /* leeg antwoord */ }
+  if (!antwoord.ok && !data.error) data.error = "server gaf status " + antwoord.status;
+  return data;
+}
+
+function json(body) {
+  return { method: "POST", headers: { "Content-Type": "application/json" },
+           body: JSON.stringify(body) };
+}
+
+// ---------------------------------------------------------------- invoer
+
+async function bekijk() {
+  const tekst = $("invoer").value;
+  if (!tekst.trim()) { melding("invoermelding", "Plak eerst iets.", true); return; }
+  melding("invoermelding", "");
+  const data = await vraag("/api/preview", json({ text: tekst }));
+  if (data.error) { melding("invoermelding", data.error, true); return; }
+
+  const lijst = $("voorbeeld");
+  lijst.innerHTML = "";
+  if (!data.urls.length) {
+    melding("invoermelding", "Geen enkele link in deze tekst gevonden.", true);
+    $("voorbeeldkaart").hidden = true;
+    return;
+  }
+  for (const regel of data.urls) {
+    const li = el("li", "regel");
+    const inhoud = el("div", "inhoud");
+    inhoud.appendChild(el("div", "titel", regel.title || regel.url));
+    if (regel.title) inhoud.appendChild(el("div", "sub", regel.url));
+    if (regel.error) inhoud.appendChild(el("div", "fout", regel.error));
+    if (regel.tandoor_url) {
+      const link = el("a", null, "In Tandoor bekijken");
+      link.href = regel.tandoor_url;
+      link.target = "_blank";
+      link.rel = "noopener";
+      const wrap = el("div", "sub");
+      wrap.appendChild(link);
+      inhoud.appendChild(wrap);
+    }
+    li.appendChild(inhoud);
+    li.appendChild(badge(regel.state));
+    lijst.appendChild(li);
+  }
+  const nieuw = data.urls.filter((r) => r.state === "nieuw" || r.state === "eerder_mislukt").length;
+  $("voorbeeldkaart").hidden = false;
+  melding("invoermelding",
+    `${data.urls.length} link(s) gevonden, waarvan ${nieuw} te importeren.`);
+}
+
+async function importeer() {
+  const tekst = $("invoer").value;
+  if (!tekst.trim()) { melding("invoermelding", "Plak eerst iets.", true); return; }
+  for (const knop of [$("importeer"), $("importeervoorbeeld")]) knop.disabled = true;
+  const data = await vraag("/api/import", json({ text: tekst }));
+  for (const knop of [$("importeer"), $("importeervoorbeeld")]) knop.disabled = false;
+
+  if (data.error) { melding("invoermelding", data.error, true); return; }
+  const delen = [`${data.toegevoegd} in de wachtrij gezet`];
+  if (data.overgeslagen && data.overgeslagen.length) {
+    delen.push(`${data.overgeslagen.length} overgeslagen`);
+  }
+  melding("invoermelding", delen.join(", ") + ".");
+  $("invoer").value = "";
+  $("voorbeeldkaart").hidden = true;
+  ververs();
+}
+
+async function upload() {
+  const bestand = $("bestand").files[0];
+  if (!bestand) { melding("bestandmelding", "Kies eerst een bestand.", true); return; }
+  const formulier = new FormData();
+  formulier.append("file", bestand);
+  $("uploadknop").disabled = true;
+  const data = await vraag("/api/upload", { method: "POST", body: formulier });
+  $("uploadknop").disabled = false;
+  melding("bestandmelding", data.error ||
+    `${data.toegevoegd} van ${data.gevonden} in de wachtrij gezet.`, !!data.error);
+  ververs();
+}
+
+// ---------------------------------------------------------------- lijst
+
+function filterknoppen(counts) {
+  const vak = $("filters");
+  vak.innerHTML = "";
+  for (const [waarde, naam] of FILTERS) {
+    const aantal = waarde ? (counts[waarde] || 0)
+                          : Object.values(counts).reduce((a, b) => a + b, 0);
+    const knop = el("button", "chip", `${naam} (${aantal})`);
+    knop.setAttribute("aria-pressed", String(filter === waarde));
+    knop.addEventListener("click", () => { filter = waarde; ververs(); });
+    vak.appendChild(knop);
+  }
+}
+
+function regelvoor(item) {
+  const li = el("li", "regel");
+  const inhoud = el("div", "inhoud");
+  inhoud.appendChild(el("div", "titel", item.title || item.url));
+  if (item.title) inhoud.appendChild(el("div", "sub", item.url));
+  if (item.error) inhoud.appendChild(el("div", "fout", item.error));
+  if (item.note) inhoud.appendChild(el("div", "sub", item.note));
+
+  const onder = el("div", "sub");
+  onder.appendChild(document.createTextNode(tijd(item.updated_at)));
+  if (item.tandoor_url) {
+    onder.appendChild(document.createTextNode(" · "));
+    const link = el("a", null, "In Tandoor bekijken");
+    link.href = item.tandoor_url;
+    link.target = "_blank";
+    link.rel = "noopener";
+    onder.appendChild(link);
+  }
+  inhoud.appendChild(onder);
+
+  li.appendChild(inhoud);
+
+  const rechts = el("div");
+  rechts.style.display = "flex";
+  rechts.style.flexDirection = "column";
+  rechts.style.gap = "6px";
+  rechts.style.alignItems = "flex-end";
+  rechts.appendChild(badge(item.status));
+  if (item.status === "mislukt") {
+    const knop = el("button", "klein", "Opnieuw");
+    knop.addEventListener("click", async () => {
+      knop.disabled = true;
+      await vraag(`/api/items/${item.id}/retry`, { method: "POST" });
+      ververs();
+    });
+    rechts.appendChild(knop);
+  }
+  li.appendChild(rechts);
+  return li;
+}
+
+async function ververs() {
+  const pad = "/api/items?limit=200" + (filter ? "&status=" + filter : "");
+  const data = await vraag(pad);
+  if (data.error) { $("statusregel").textContent = data.error; return; }
+
+  const counts = data.counts || {};
+  filterknoppen(counts);
+
+  const lijst = $("lijst");
+  lijst.innerHTML = "";
+  if (!data.items.length) {
+    lijst.appendChild(el("li", "leeg",
+      filter ? "Niets met deze status." : "Nog niets geïmporteerd."));
+  } else {
+    for (const item of data.items) lijst.appendChild(regelvoor(item));
+  }
+
+  $("opnieuwalles").hidden = !counts.mislukt;
+
+  const onderweg = ONDERWEG.reduce((som, s) => som + (counts[s] || 0), 0);
+  const stukken = [];
+  if (onderweg) stukken.push(`${onderweg} in de wachtrij`);
+  if (counts.klaar) stukken.push(`${counts.klaar} geïmporteerd`);
+  if (counts.mislukt) stukken.push(`${counts.mislukt} mislukt`);
+  $("statusregel").textContent = stukken.length ? stukken.join(" · ") : "nog niets te doen";
+
+  // Is er werk onderweg, kijk dan vaker.
+  clearTimeout(timer);
+  timer = setTimeout(ververs, onderweg ? 3000 : 15000);
+}
+
+// ---------------------------------------------------------------- opstart
+
+$("bekijk").addEventListener("click", bekijk);
+$("importeer").addEventListener("click", importeer);
+$("importeervoorbeeld").addEventListener("click", importeer);
+$("uploadknop").addEventListener("click", upload);
+$("opnieuwalles").addEventListener("click", async () => {
+  await vraag("/api/retry-failed", { method: "POST" });
+  ververs();
+});
+// Op de telefoon is ctrl/cmd+enter sneller dan naar de knop reiken.
+$("invoer").addEventListener("keydown", (e) => {
+  if ((e.metaKey || e.ctrlKey) && e.key === "Enter") importeer();
+});
+
+ververs();
+</script>
+</body>
+</html>
