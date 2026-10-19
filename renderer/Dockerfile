@@ -13,6 +13,13 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY renderer.py ./
 
+# Hier is deze container al een keer op omgevallen: de COPY hierboven stond er
+# niet, de build slaagde en op de NAS kwam hij in een herstartlus. Nu valt de
+# build om in plaats daarvan. Dit staat vóór de playwright-install, want dan
+# kost die controle seconden en geen minuten. (Playwright zelf wordt pas in de
+# functies geïmporteerd, dus deze regel heeft de browser nog niet nodig.)
+RUN python -c "import renderer"
+
 # --with-deps haalt de systeempakketten op die Chromium nodig heeft. Dit maakt
 # het image groot (~1,2 GB); dat is de prijs van een echte browser, en de reden
 # dat dit een aparte container is in plaats van onderdeel van de brug.
