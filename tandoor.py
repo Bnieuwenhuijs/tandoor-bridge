@@ -24,6 +24,7 @@ documentatie staan en elk afzonderlijk stil kan mislukken:
   vangnet.
 """
 
+import json as _json
 import logging
 import re
 import time
@@ -88,6 +89,7 @@ def prepare_data(html: str, url: str) -> str:
 _CANONICAL_TAG_RE = re.compile(r"""<link\b[^>]*\brel\s*=\s*["']?canonical\b["']?[^>]*>""", re.I)
 _HREF_RE = re.compile(r"""\bhref\s*=\s*["']([^"']*)["']""", re.I)
 _HEAD_OPEN_RE = re.compile(r"<head\b[^>]*>", re.I)
+_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
 _HTML_OPEN_RE = re.compile(r"<html\b[^>]*>", re.I)
 
 
@@ -107,7 +109,9 @@ def with_canonical(html: str, url: str) -> str:
     opnieuw weggeschreven, zodat de rest van de pagina byte voor byte intact
     blijft.
     """
-    if bestaand := _CANONICAL_TAG_RE.search(html):
+    # Zoeken buiten commentaar om: <!-- <link rel="canonical" ...> --> is geen
+    # uitspraak van de pagina, en BeautifulSoup leest hem ook niet.
+    if bestaand := _CANONICAL_TAG_RE.search(_COMMENT_RE.sub("", html)):
         href = _HREF_RE.search(bestaand.group(0))
         if href and href.group(1).strip().lower().startswith(("http://", "https://")):
             return html  # de pagina weet het zelf al
@@ -240,6 +244,10 @@ class TandoorNoRecipe(TandoorError):
     """Tandoor kon in deze pagina geen recept vinden. Niet onze fout."""
 
 
+class TandoorUnreachable(TandoorError):
+    """Tandoor antwoordde niet. Meestal tijdelijk, dus geen eindoordeel."""
+
+
 class TandoorThrottled(TandoorError):
     """De importlimiet is bereikt; na retry_after seconden mag het weer."""
 
@@ -338,19 +346,35 @@ class TandoorClient:
 
     # -- laag niveau ------------------------------------------------------
 
-    def _request(self, method: str, path: str, *, json=None, files=None, ok=(200, 201)) -> dict:
+    def _request(self, method: str, path: str, *, json=None, files=None,
+                 ok=(200, 201), retry: bool = True) -> dict:
+        """
+        retry=False voor aanroepen die niet veilig te herhalen zijn.
+
+        POST /api/recipe/ is er zo een: gaat het antwoord verloren nadat
+        Tandoor het recept al heeft aangemaakt, dan maakt een tweede identieke
+        body een tweede recept. Dat gebeurt echt - een 502 van de proxy
+        terwijl Tandoor herstart, of een create met veel nieuwe foods die
+        langer duurt dan de leestimeout. Eén poging, en de wachtrij lost de
+        rest op: bij een handmatige nieuwe poging ziet Tandoors eigen
+        duplicates-lijst het recept en wordt het item "bestaat al".
+
+        Een GET en recipe-from-source hebben geen bijwerking en mogen wel
+        herhaald worden; de afbeelding-PUT vervangt de foto, dus die ook.
+        """
         url = f"{self.base_url}{path}"
         laatste: TandoorError | None = None
+        max_pogingen = self._max_retries if retry else 1
 
-        for poging in range(1, self._max_retries + 1):
+        for poging in range(1, max_pogingen + 1):
             try:
                 resp = self._session.request(method, url, json=json, files=files,
                                              timeout=self._timeout)
             except requests.RequestException as e:
-                laatste = TandoorError(
+                laatste = TandoorUnreachable(
                     f"Tandoor is niet te bereiken op {self.base_url} ({e.__class__.__name__})"
                 )
-                if poging < self._max_retries:
+                if poging < max_pogingen:
                     self._sleep(2 ** poging)
                     continue
                 raise laatste from e
@@ -360,7 +384,7 @@ class TandoorClient:
                 payload = _payload(resp)
                 # Korte wachttijden lossen we hier op; een uur wachten is een
                 # beslissing voor de wachtrij, niet voor één aanroep.
-                if wacht <= self._max_throttle_wait and poging < self._max_retries:
+                if wacht <= self._max_throttle_wait and poging < max_pogingen:
                     log.warning("importlimiet bereikt, %s seconden wachten", wacht)
                     self._sleep(wacht)
                     continue
@@ -371,7 +395,7 @@ class TandoorClient:
             if resp.status_code in ok:
                 return _payload(resp)
 
-            if 500 <= resp.status_code < 600 and poging < self._max_retries:
+            if 500 <= resp.status_code < 600 and poging < max_pogingen:
                 log.warning("Tandoor gaf %s, nog een poging", resp.status_code)
                 self._sleep(2 ** poging)
                 continue
@@ -399,13 +423,17 @@ class TandoorClient:
         De url gaat mee náást de data: Tandoor haalt de pagina dan nog steeds
         niet zelf op, maar vult wel 'duplicates' op basis van source_url.
         """
-        data = prepare_data(html, url)
-        if len(data.encode("utf-8")) > DJANGO_BODY_LIMIT - 4096:
+        body = {"url": url, "data": prepare_data(html, url)}
+
+        # Meten op de werkelijke body: JSON ontsnapt aanhalingstekens en
+        # regeleinden, dus die is merkbaar groter dan de HTML zelf. Django
+        # weigert erboven met gewone HTML in plaats van een melding.
+        body_bytes = len(_json.dumps(body).encode("utf-8"))
+        if body_bytes > DJANGO_BODY_LIMIT - 4096:
             raise TandoorError(
-                f"de pagina is te groot voor Tandoor ({len(data) // 1024} KB; "
-                f"de grens ligt bij {DJANGO_BODY_LIMIT // 1024} KB)"
+                f"de pagina is te groot voor Tandoor ({body_bytes // 1024} KB aan "
+                f"verzoek; de grens ligt bij {DJANGO_BODY_LIMIT // 1024} KB)"
             )
-        body = {"url": url, "data": data}
         try:
             payload = self._request("POST", "/api/recipe-from-source/", json=body, ok=(200,))
         except TandoorError as e:
@@ -439,7 +467,8 @@ class TandoorClient:
         exact de opgeschoonde URL die ook onze dubbel-sleutel is.
         """
         body = recipe_payload(recipe, source_url, send_properties=self.send_properties)
-        aangemaakt = self._request("POST", "/api/recipe/", json=body, ok=(200, 201))
+        aangemaakt = self._request("POST", "/api/recipe/", json=body, ok=(200, 201),
+                                   retry=False)
         if not aangemaakt.get("id"):
             raise TandoorError("Tandoor gaf geen id terug bij het aanmaken van het recept")
         return aangemaakt
