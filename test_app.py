@@ -292,3 +292,35 @@ def test_onzinnige_instellingen_vallen_terug_op_de_standaard(monkeypatch):
     instellingen = appmodule.config_from_env()
     assert instellingen["delay"] == 5.0
     assert instellingen["port"] == 8095
+
+
+def test_diagnose_vergelijkt_de_manieren_van_ophalen(brug, monkeypatch):
+    """
+    De knop voor "waarom lukt deze site niet". Tandoor komt er niet aan te
+    pas, dus het kost ook geen plaats in zijn importlimiet.
+    """
+    http, _, _ = brug
+    import fetcher
+
+    def nep_probe(url, *, timeout=20):
+        return [
+            {"poging": "requests, minimale headers", "ok": False,
+             "status": 403, "reden": "geblokkeerd (status 403)"},
+            {"poging": "requests, volledige headers", "ok": True, "status": 200,
+             "final_url": url,
+             "pagina": {"bytes": 1234, "titel": "Kip korma", "heeft_schema": True,
+                        "ld_json_blokken": 1}},
+            {"poging": "curl_cffi, impersonate=chrome", "ok": False,
+             "reden": "curl_cffi is hier niet geïnstalleerd"},
+        ]
+
+    monkeypatch.setattr(fetcher, "probe", nep_probe)
+    data = http.get("/api/diagnose?url=https://www.ah.nl/r/921580").get_json()
+    assert data["url"] == "https://www.ah.nl/allerhande/recept/R-R921580"
+    assert "volledige headers" in data["conclusie"]
+    assert len(data["pogingen"]) == 3
+
+
+def test_diagnose_zonder_url(brug):
+    http, _, _ = brug
+    assert http.get("/api/diagnose").status_code == 400

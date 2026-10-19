@@ -48,6 +48,13 @@ class _Handler(BaseHTTPRequestHandler):
             self._stuur(403, "text/html", AKAMAI_BLOKKADE)
         elif self.path == "/zachte-blokkade":
             self._stuur(200, "text/html", AKAMAI_BLOKKADE)
+        elif self.path == "/alleen-met-volledige-headers":
+            # Sommige sites willen juist de headers zien die een echte
+            # navigatie verraden; die geven de minimale set een 403.
+            if "Sec-Fetch-Mode" in self.headers:
+                self._stuur(200, "text/html; charset=utf-8", RECEPTPAGINA)
+            else:
+                self._stuur(403, "text/html", AKAMAI_BLOKKADE)
         elif self.path == "/verdwenen":
             self._stuur(404, "text/html", b"<html>niet gevonden</html>")
         elif self.path == "/leeg":
@@ -104,12 +111,28 @@ def test_gewone_pagina_komt_onbewerkt_binnen(site):
     assert '<link rel="canonical" href="https://www.ah.nl/allerhande/recept/R-R921580"/>' in result.html
 
 
-def test_browserheaders_gaan_mee(site):
+def test_eerste_poging_gebruikt_de_bewezen_headers(site):
+    """
+    De eerste poging is de set uit recipe_parser, en dat is geen willekeurige
+    keuze. De uitgebreidere set hieronder leverde bij AH juist een 403 op:
+    Akamai kijkt naar de combinatie, en Chrome-headers zonder bijpassende
+    TLS-vingerafdruk zijn verdachter dan een kale User-Agent.
+    """
     fetch_page(f"{site}/ok")
     headers = laatste_headers("/ok")
     assert "Chrome/126" in headers["User-Agent"]
     assert headers["Accept-Language"] == "nl-NL,nl;q=0.9,en;q=0.8"
-    # De headers die een echte navigatie verraden, en die Tandoor zelf niet stuurt.
+    assert "Sec-Fetch-Mode" not in headers          # bewust niet, nog niet
+    assert "Sec-Ch-Ua" not in headers
+
+
+def test_tweede_poging_stuurt_de_volledige_headers(site):
+    """En een site die juist dié headers wil, komt alsnog binnen."""
+    result = fetch_page(f"{site}/alleen-met-volledige-headers")
+    assert result.via == "requests+headers"
+    assert "Kip korma met spinazie" in result.html
+
+    headers = laatste_headers("/alleen-met-volledige-headers")
     assert headers["Sec-Fetch-Mode"] == "navigate"
     assert headers["Upgrade-Insecure-Requests"] == "1"
 

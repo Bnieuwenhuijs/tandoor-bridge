@@ -33,10 +33,22 @@ import requests
 
 log = logging.getLogger(__name__)
 
-# De headers waarmee ah.nl, voedingscentrum.nl en leukerecepten.nl antwoorden.
-# De User-Agent en Accept-Language komen uit recipe_parser, waar ze zich al
-# bewezen hebben; de rest stuurt een echte Chrome er altijd bij, en een
-# pagina-aanvraag zonder Sec-Fetch-* valt juist daardoor op.
+# De set die zich bewezen heeft. Letterlijk die uit recipe_parser, waarmee
+# ah.nl, voedingscentrum.nl en leukerecepten.nl maanden lang gewoon
+# antwoordden. Dit is de eerste poging, en dat is geen willekeurige keuze: een
+# uitgebreidere set hieronder bleek bij AH juist een 403 op te leveren.
+# Akamai kijkt naar de combinatie, en Chrome-headers zonder bijpassende
+# TLS-vingerafdruk zijn verdachter dan een kale User-Agent.
+HEADERS_MINIMAAL = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "nl-NL,nl;q=0.9,en;q=0.8",
+}
+
+# De volledige set, als tweede poging. Sommige sites willen juist wél de
+# headers zien die een echte navigatie verraden.
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -203,12 +215,13 @@ def _judge(url: str, status: int, text: str, final_url: str, *, via: str) -> _At
                     result=FetchResult(url, final_url, status, text, via))
 
 
-def _attempt_requests(url: str, *, timeout: int) -> _Attempt:
+def _attempt_requests(url: str, *, timeout: int, headers=None, naam="requests") -> _Attempt:
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=timeout, allow_redirects=True)
+        resp = requests.get(url, headers=headers or HEADERS_MINIMAAL,
+                            timeout=timeout, allow_redirects=True)
     except requests.RequestException as e:
         return _Attempt(False, f"netwerkfout ({e.__class__.__name__})")
-    return _judge(url, resp.status_code, resp.text, resp.url, via="requests")
+    return _judge(url, resp.status_code, resp.text, resp.url, via=naam)
 
 
 def _attempt_curl(url: str, *, timeout: int) -> _Attempt | None:
@@ -219,7 +232,7 @@ def _attempt_curl(url: str, *, timeout: int) -> _Attempt | None:
         log.warning("curl_cffi is niet geïnstalleerd, tweede poging overgeslagen")
         return None
     try:
-        resp = curl_requests.get(url, headers=HEADERS, timeout=timeout,
+        resp = curl_requests.get(url, headers=HEADERS_MINIMAAL, timeout=timeout,
                                  impersonate=IMPERSONATE, allow_redirects=True)
     except Exception as e:  # curl_cffi gooit z'n eigen fouttypes
         return _Attempt(False, f"netwerkfout met curl_cffi ({e.__class__.__name__})")
@@ -232,29 +245,73 @@ def fetch_page(url: str, *, timeout: int = 20, impersonate: bool = True) -> Fetc
 
     De HTML gaat hierna onbewerkt naar Tandoor: wij ontleden niets.
     """
-    eerste = _attempt_requests(url, timeout=timeout)
+    eerste = _attempt_requests(url, timeout=timeout,
+                               headers=HEADERS_MINIMAAL, naam="requests")
     if eerste.ok:
         log.info("opgehaald: %s (status %s)", url, eerste.status)
         return eerste.result
+    log.warning("poging 1 (minimale headers) mislukt voor %s: %s", url, eerste.reason)
 
-    log.warning("eerste poging mislukt voor %s: %s", url, eerste.reason)
+    tweede = _attempt_requests(url, timeout=timeout,
+                               headers=HEADERS, naam="requests+headers")
+    if tweede.ok:
+        log.info("poging 2 (volledige headers) gelukt: %s", url)
+        return tweede.result
+    log.warning("poging 2 (volledige headers) mislukt voor %s: %s", url, tweede.reason)
+
     if not impersonate:
-        raise FetchError(eerste.reason, status=eerste.status)
+        raise FetchError(f"{eerste.reason}; met volledige headers: {tweede.reason}",
+                         status=eerste.status)
 
-    tweede = _attempt_curl(url, timeout=timeout)
-    if tweede is None:
+    derde = _attempt_curl(url, timeout=timeout)
+    if derde is None:
         raise FetchError(
-            f"{eerste.reason}; curl_cffi is niet beschikbaar voor een tweede poging",
+            f"{eerste.reason}; curl_cffi is niet beschikbaar voor een derde poging",
             status=eerste.status,
         )
-    if tweede.ok:
-        log.info("tweede poging met curl_cffi gelukt: %s", url)
-        return tweede.result
+    if derde.ok:
+        log.info("poging 3 met curl_cffi gelukt: %s", url)
+        return derde.result
 
     raise FetchError(
-        f"{eerste.reason}; ook met curl_cffi: {tweede.reason}",
-        status=tweede.status or eerste.status,
+        f"{eerste.reason}; ook met curl_cffi: {derde.reason}",
+        status=derde.status or eerste.status,
     )
+
+
+def probe(url: str, *, timeout: int = 20) -> list:
+    """
+    Probeer alle manieren náást elkaar en zeg per poging wat eruit kwam.
+
+    Alleen voor het stellen van een diagnose: dit haalt dezelfde pagina tot
+    drie keer op, dus niet gebruiken in de wachtrij.
+    """
+    varianten = (
+        ("requests, minimale headers",
+         lambda: _attempt_requests(url, timeout=timeout,
+                                   headers=HEADERS_MINIMAAL, naam="requests")),
+        ("requests, volledige headers",
+         lambda: _attempt_requests(url, timeout=timeout,
+                                   headers=HEADERS, naam="requests+headers")),
+        (f"curl_cffi, impersonate={IMPERSONATE}",
+         lambda: _attempt_curl(url, timeout=timeout)),
+    )
+
+    uitkomsten = []
+    for naam, poging in varianten:
+        uitkomst = poging()
+        if uitkomst is None:
+            uitkomsten.append({"poging": naam, "ok": False,
+                               "reden": "curl_cffi is hier niet geïnstalleerd"})
+            continue
+        regel = {"poging": naam, "ok": uitkomst.ok, "status": uitkomst.status}
+        if uitkomst.ok:
+            regel["final_url"] = uitkomst.result.final_url
+            regel["pagina"] = describe_page(uitkomst.result.html)
+        else:
+            regel["reden"] = uitkomst.reason
+        uitkomsten.append(regel)
+    return uitkomsten
 
 
 def fetch_image(url: str, *, referer: str | None = None, timeout: int = 20) -> tuple[bytes, str]:
