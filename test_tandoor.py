@@ -7,15 +7,11 @@ die stil kunnen mislukken: unquote() over 'data', de bron-URL uit de
 canonical, en de naamcontrole op een geüploade foto.
 """
 
-import pathlib
-import threading
-from urllib.parse import unquote
-
 import pytest
 import requests
-from werkzeug.serving import make_server
+from urllib.parse import unquote
 
-from mock_tandoor import create_app
+from conftest import AH_HTML, AH_URL, JPEG, PUBLIC_URL, mock_server
 from tandoor import (
     DJANGO_BODY_LIMIT,
     TandoorClient,
@@ -30,40 +26,9 @@ from tandoor import (
     with_canonical,
 )
 
-FIXTURES = pathlib.Path(__file__).parent / "fixtures"
-AH_HTML = (FIXTURES / "ah_kip_korma.html").read_text(encoding="utf-8")
-AH_URL = "https://www.ah.nl/allerhande/recept/R-R921580/kip-korma-met-spinazie"
-JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 256
-
-
-class _Server:
-    def __init__(self, app):
-        self._server = make_server("127.0.0.1", 0, app)
-        self.port = self._server.server_port
-        self.url = f"http://127.0.0.1:{self.port}"
-        threading.Thread(target=self._server.serve_forever, daemon=True).start()
-
-    def stop(self):
-        self._server.shutdown()
-
-
-@pytest.fixture
-def tandoor():
-    """Een draaiende nagebouwde Tandoor, zonder limiet."""
-    server = _Server(create_app())
-    try:
-        yield server
-    finally:
-        server.stop()
-
-
-@pytest.fixture
-def client(tandoor):
-    return TandoorClient(tandoor.url, "tda_testtoken", public_url="http://tail2bbdeb.ts.net:30290")
-
 
 def mock_state(server):
-    return requests.get(f"{server.url}/__mock/state").json()
+    return server.state()
 
 
 # ------------------------------------------------------- de HTML beschermen
@@ -199,7 +164,7 @@ def test_volledige_flow(client, tandoor):
     assert state["images"]["1"] == "recept.jpg"
     assert state["recipes"][0]["image"] == "/media/recipes/1.jpg"
     # De link die ik in de interface aanklik gaat via het publieke adres.
-    assert client.recipe_url(recept["id"]) == "http://tail2bbdeb.ts.net:30290/recipe/1"
+    assert client.recipe_url(recept["id"]) == f"{PUBLIC_URL}/recipe/1"
 
 
 def test_source_url_wordt_meteen_gezet(client, tandoor):
@@ -286,7 +251,7 @@ def test_check_connection_geeft_aantal(client):
 # ------------------------------------------------------- limiet van 60 per uur
 
 def test_korte_wachttijd_wordt_afgewacht():
-    server = _Server(create_app(throttle_after=1, retry_after=3))
+    server = mock_server(throttle_after=1, retry_after=3)
     geslapen = []
     client = TandoorClient(server.url, "tda_x", max_retries=2, sleep=geslapen.append)
     try:
@@ -306,7 +271,7 @@ def test_lange_wachttijd_gaat_naar_de_wachtrij():
     mag één aanroep niet gaan liggen slapen: dat is een beslissing voor de
     wachtrij.
     """
-    server = _Server(create_app(throttle_after=1, retry_after=3500))
+    server = mock_server(throttle_after=1, retry_after=3500)
     geslapen = []
     client = TandoorClient(server.url, "tda_x", sleep=geslapen.append)
     try:
