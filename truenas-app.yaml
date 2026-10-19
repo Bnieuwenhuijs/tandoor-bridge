@@ -57,13 +57,18 @@ services:
       - "8095:8095"
 
     volumes:
-      # Een pad op de host, zodat de geschiedenis in een dataset staat die
-      # meegaat in je snapshots. Pas <pool> aan.
+      # Een pad op de host, zodat de geschiedenis in een eigen dataset staat
+      # die meegaat in je snapshots. Pas <pool> aan, maak de dataset vooraf
+      # aan, en geef hem aan uid/gid 568.
       #
-      # Een Docker-volume kan ook (- bridgedata:/data plus een volumes-blok
-      # onderaan); dan hoef je niets te chownen omdat Docker het eigendom uit
-      # het image overneemt, maar dan moet de regel user: hierboven weg én
-      # valt de map buiten je snapshots.
+      # Wil je dat gepruts met rechten niet, zie VARIANT B onderaan.
+      #
+      # Een ixVolume is hier géén optie: dat is een TrueNAS-schemabegrip en
+      # geen Docker-Compose-begrip, dus het bestaat alleen in de
+      # formulier-variant van Custom App - en die laat je de YAML-editor
+      # voorgoed kwijtraken. TrueNAS raadt ixVolumes voor data die je wilt
+      # houden trouwens zelf af, omdat ze in de verborgen ix-apps-dataset
+      # landen en back-ups bemoeilijken.
       - /mnt/<pool>/apps/tandoor-bridge/data:/data
 
     logging:
@@ -73,3 +78,43 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+
+# ---------------------------------------------------------------------------
+# VARIANT B: met een named volume, zonder iets vooraf aan te maken
+# ---------------------------------------------------------------------------
+# Dit is de kortste weg naar werkend. Docker vult een leeg named volume met de
+# inhoud én het eigendom uit het image, en daar is /data van uid 10001 - dus
+# geen dataset aanmaken, geen chown, geen ACL's.
+#
+# Let op de twee verschillen met hierboven, en neem ze samen over: er staat
+# GEEN user:-regel (de container draait als 10001, de eigenaar van het volume),
+# en er is een volumes-blok op het hoogste niveau.
+#
+# De keerzijde is dezelfde als bij een ixVolume: je geschiedenis zit in Dockers
+# eigen map en niet in een eigen dataset, dus minder handig voor back-ups.
+#
+# services:
+#   tandoor-bridge:
+#     image: ghcr.io/bnieuwenhuijs/tandoor-bridge:latest
+#     restart: unless-stopped
+#     environment:
+#       TANDOOR_URL: "http://192.168.1.130:30290"
+#       TANDOOR_TOKEN: "tda_vul_hier_je_eigen_token_in"
+#       TANDOOR_PUBLIC_URL: ""
+#       PORT: "8095"
+#       IMPORT_DELAY_SECONDS: "5"
+#       DATA_DIR: "/data"
+#       SEND_PROPERTIES: "false"
+#       LOG_LEVEL: "INFO"
+#     ports:
+#       - "8095:8095"
+#     volumes:
+#       - bridgedata:/data
+#     logging:
+#       driver: json-file
+#       options:
+#         max-size: "10m"
+#         max-file: "3"
+# volumes:
+#   bridgedata:
