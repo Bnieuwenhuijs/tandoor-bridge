@@ -11,6 +11,8 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
+COPY app.py ./
+
 # --with-deps haalt de systeempakketten op die Chromium nodig heeft. Dit maakt
 # het image groot (~1,2 GB); dat is de prijs van een echte browser, en de reden
 # dat dit een aparte container is in plaats van onderdeel van de brug.
