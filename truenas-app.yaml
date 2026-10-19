@@ -11,6 +11,12 @@
 #   2. TANDOOR_URL — het adres waarop de NAS je Tandoor kan bereiken
 #   3. TANDOOR_TOKEN — uit Tandoor: Instellingen → API, scope "read write"
 #
+# Is het GHCR-package privé (dat erft het van de repo), dan kan TrueNAS het
+# niet pullen: de YAML-editor heeft geen veld voor registratie-inloggegevens.
+# Zet het package op openbaar (GitHub → Packages → tandoor-bridge → Package
+# settings → Change visibility). In het image zit niets gevoeligs: geen .env
+# en geen token, want dat komt pas bij het starten uit de omgeving.
+#
 # Let op: het token staat hier in leesbare vorm en TrueNAS bewaart deze YAML
 # bij de app-configuratie. Wie bij de TrueNAS-interface kan, kan het dus
 # lezen. Voor een NAS op je eigen netwerk is dat meestal goed; ga ervan uit
@@ -18,6 +24,11 @@
 
 services:
   tandoor-bridge:
+    # CI tagt :latest alleen vanaf de standaardbranch. Staat de code nog op
+    # een feature-branch, gebruik dan de branchtag - die bestaat wel:
+    #   ghcr.io/bnieuwenhuijs/tandoor-bridge:claude-practical-johnson-jsrrgm
+    # Na een merge naar main is :latest de juiste, want dan hoef je bij een
+    # update niets aan deze regel te veranderen.
     image: ghcr.io/bnieuwenhuijs/tandoor-bridge:latest
     restart: unless-stopped
 
