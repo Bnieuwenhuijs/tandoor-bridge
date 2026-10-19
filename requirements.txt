@@ -3,6 +3,10 @@
 Flask==3.1.3
 requests==2.34.2
 
+# De wachtrij-thread leeft in het webproces, dus gunicorn draait met precies
+# één worker. Zie de opmerking onderaan de Dockerfile.
+gunicorn==26.2.0
+
 # Tweede poging voor sites die niet naar de headers maar naar de
 # TLS-vingerafdruk kijken. Heeft een abi3-wheel voor manylinux x86_64, dus op
 # de Ugreen NAS wordt er niets gecompileerd. Zie README bij "een site

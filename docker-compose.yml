@@ -1,0 +1,24 @@
+# Voor UGOS: zet dit bestand samen met .env in een map op de NAS en start het
+# via Docker → Project, of met `docker compose up -d`.
+services:
+  tandoor-bridge:
+    image: ghcr.io/bnieuwenhuijs/tandoor-bridge:latest
+    # Zelf bouwen in plaats van het image pullen? Haal de regel hierboven weg
+    # en zet in plaats daarvan: build: .
+    container_name: tandoor-bridge
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      # Alleen op het LAN en via Tailscale, niet naar het internet
+      # doorzetten in je router.
+      - "8095:8095"
+    volumes:
+      # De geschiedenis moet een herstart en een update overleven.
+      - ./data:/data
+    logging:
+      # Zonder grens groeien de logs van een container die maanden draait
+      # door tot ze de schijf vullen.
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
