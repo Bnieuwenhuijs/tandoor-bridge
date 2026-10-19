@@ -332,10 +332,15 @@ def test_een_kapotte_browser_container_laat_de_reden_zien(site):
 
 
 def test_browser_container_onbereikbaar(site):
-    """De brug mag niet omvallen als de tweede container uit staat."""
+    """
+    De brug mag niet omvallen als de tweede container uit staat - en de
+    melding moet zeggen wélke van de drie oorzaken het is, want een kale
+    ConnectionError stuurt je de verkeerde kant op.
+    """
     with pytest.raises(FetchError) as fout:
         fetch_page(f"{site}/geweigerd", renderer_url="http://127.0.0.1:1")
-    assert "niet te bereiken" in fout.value.reason
+    assert "browser-container niet bereikt" in fout.value.reason
+    assert "luistert niet op poort 1" in fout.value.reason
 
 
 def test_verdwenen_pagina_kost_geen_browserronde(site):
@@ -345,3 +350,49 @@ def test_verdwenen_pagina_kost_geen_browserronde(site):
         fetch_page(f"{site}/verdwenen", renderer_url=site)
     assert fout.value.status == 404
     assert not [p for p, _ in _Handler.ontvangen if p == "/render"]
+
+
+# ------------------------------------------- waarom antwoordt de browser niet
+
+def test_diagnose_een_naam_die_niet_bestaat():
+    """
+    Het geval dat je krijgt als de tweede service niet in dezelfde YAML staat.
+    """
+    from fetcher import renderer_diagnose
+
+    uit = renderer_diagnose("http://deze-naam-bestaat-niet-12345:8096")
+    assert uit["ingesteld"] is True
+    assert uit["naam_lost_op"] is False
+    assert "bestaat niet in dit Docker-netwerk" in uit["reden"]
+    assert "dezelfde" in uit["reden"]
+
+
+def test_diagnose_een_dichte_poort():
+    """En dit krijg je als de container er wel is maar niet luistert."""
+    from fetcher import renderer_diagnose
+
+    uit = renderer_diagnose("http://127.0.0.1:1")
+    assert uit["naam_lost_op"] is True
+    assert uit["poort_open"] is False
+    assert "luistert niet op poort 1" in uit["reden"]
+    assert "logboek" in uit["reden"]
+
+
+def test_diagnose_een_draaiende_container(site):
+    from fetcher import renderer_diagnose
+
+    uit = renderer_diagnose(site)
+    assert uit["naam_lost_op"] is True
+    assert uit["poort_open"] is True
+    # /healthz bestaat niet op de testserver, dus gezond is False - maar de
+    # poort staat open, en dat is het verschil dat we willen zien.
+    assert uit["gezond"] is False
+    assert "healthz" in uit["reden"]
+
+
+def test_diagnose_zonder_browser_container():
+    from fetcher import renderer_diagnose
+
+    uit = renderer_diagnose("")
+    assert uit["ingesteld"] is False
+    assert "RENDERER_URL is leeg" in uit["reden"]

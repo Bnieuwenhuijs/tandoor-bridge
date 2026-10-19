@@ -28,7 +28,9 @@ staat op een lijst".
 import logging
 import os
 import re
+import socket
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 import requests
 
@@ -257,11 +259,11 @@ def _attempt_renderer(url: str, *, timeout: int, renderer: str) -> _Attempt:
         resp = requests.post(f"{renderer}/render", json={"url": url},
                              timeout=(5, timeout + 60))
     except requests.RequestException as e:
-        # Dit is bijna altijd een deployment-oorzaak en niet een netwerkstoring,
-        # dus noem die: een kale ConnectionError stuurt je de verkeerde kant op.
-        return _Attempt(False, f"browser-container niet te bereiken op {renderer} "
-                               f"({e.__class__.__name__}) - draait die container, "
-                               f"en kon z'n image gepulld worden?")
+        # Dit is bijna altijd een deployment-oorzaak en niet een netwerkstoring.
+        # renderer_diagnose() zegt welke van de drie het is, en dat scheelt een
+        # ronde zoeken.
+        uitleg = renderer_diagnose(renderer).get("reden") or e.__class__.__name__
+        return _Attempt(False, f"browser-container niet bereikt op {renderer}: {uitleg}")
     try:
         body = resp.json()
     except ValueError:
@@ -349,6 +351,60 @@ def renderer_health(renderer: str, *, timeout: int = 3) -> bool | None:
         return resp.status_code == 200 and bool((resp.json() or {}).get("ok"))
     except (requests.RequestException, ValueError):
         return False
+
+
+def renderer_diagnose(renderer: str, *, timeout: float = 3.0) -> dict:
+    """
+    Waarom antwoordt de browser-container niet?
+
+    Een ConnectionError gooit drie heel verschillende oorzaken op één hoop, en
+    ze hebben elk een andere oplossing:
+
+    * de naam lost niet op  -> de tweede service staat niet in dezelfde YAML,
+      of heet anders;
+    * de naam lost op maar de poort is dicht -> de container is er wel maar
+      luistert niet, of valt bij de start om;
+    * poort open, /healthz stil -> hij draait maar is nog niet klaar, of de
+      browserthread is gestopt.
+    """
+    renderer = (renderer or "").rstrip("/")
+    if not renderer:
+        return {"ingesteld": False,
+                "reden": "RENDERER_URL is leeg; er is geen browser-container"}
+
+    delen = urlsplit(renderer)
+    host = delen.hostname or ""
+    poort = delen.port or (443 if delen.scheme == "https" else 80)
+    uit = {"ingesteld": True, "host": host, "poort": poort}
+
+    try:
+        uit["ip"] = socket.gethostbyname(host)
+    except OSError as e:
+        uit["naam_lost_op"] = False
+        uit["reden"] = (
+            f"de naam '{host}' bestaat niet in dit Docker-netwerk "
+            f"({e.__class__.__name__}). Staat de tweede service in dezelfde "
+            f"YAML, met exact die naam?")
+        return uit
+    uit["naam_lost_op"] = True
+
+    try:
+        with socket.create_connection((host, poort), timeout=timeout):
+            pass
+    except OSError as e:
+        uit["poort_open"] = False
+        uit["reden"] = (
+            f"{host} bestaat ({uit['ip']}) maar luistert niet op poort {poort} "
+            f"({e.__class__.__name__}). De container is er dus wel - kijk in "
+            f"z'n logboek of hij bij de start omvalt.")
+        return uit
+    uit["poort_open"] = True
+
+    uit["gezond"] = renderer_health(renderer, timeout=timeout)
+    uit["reden"] = "" if uit["gezond"] else (
+        f"poort {poort} staat open maar /healthz antwoordt niet; hij start "
+        f"misschien nog op")
+    return uit
 
 
 def probe(url: str, *, timeout: int = 20) -> list:
