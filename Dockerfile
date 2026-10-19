@@ -1,9 +1,16 @@
 FROM python:3.12-slim
 
+# HOME is er voor gunicorn: die zet z'n control socket in $HOME, en de
+# gebruiker waaronder we draaien heeft geen eigen map. Zonder deze regel staat
+# er bij elke start een "Control server error: Permission denied" in het
+# logboek - een fout die niets kapotmaakt maar wel verkeerd doet vermoeden.
+# (Het commentaar staat bewust vóór de instructie en niet tussen de
+# regelvoortzettingen, want daar is niet elke Dockerfile-parser blij mee.)
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     DATA_DIR=/data \
-    PORT=8095
+    PORT=8095 \
+    HOME=/tmp
 
 WORKDIR /app
 

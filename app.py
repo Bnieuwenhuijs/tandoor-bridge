@@ -40,6 +40,35 @@ def config_from_env() -> dict:
     }
 
 
+def _schrijfbare_datamap(pad: str) -> Path:
+    """
+    Controleer de datamap voordat er iets anders gebeurt.
+
+    Dit is de fout die bij het inrichten als eerste langskomt: de container
+    draait niet als root, en een gekoppelde map van de NAS is vaak van iemand
+    anders. Zonder deze controle krijg je een PermissionError ergens diep in
+    een gunicorn-traceback met "Worker failed to boot" eronder, en daar staat
+    niet in wat je eraan moet doen.
+    """
+    map_pad = Path(pad)
+    try:
+        map_pad.mkdir(parents=True, exist_ok=True)
+        proef = map_pad / ".schrijftest"
+        proef.touch()
+        proef.unlink()
+    except OSError as e:
+        raise RuntimeError(
+            f"kan niet schrijven in {map_pad} (deze container draait als uid "
+            f"{os.getuid()}, gid {os.getgid()}): {e.strerror}. "
+            f"Geef die map eigendom aan deze gebruiker "
+            f"(chown -R {os.getuid()}:{os.getgid()} <pad op de host>), of laat de "
+            f"container als de eigenaar van die map draaien met user: \"<uid>:<gid>\" "
+            f"in docker-compose.yml, of gebruik een Docker-volume in plaats van een "
+            f"pad op de host."
+        ) from e
+    return map_pad
+
+
 def create_app(*, store=None, client=None, queue=None, start_worker=True,
                config=None) -> Flask:
     """
@@ -58,9 +87,7 @@ def create_app(*, store=None, client=None, queue=None, start_worker=True,
             send_properties=instellingen["send_properties"],
         )
     if store is None:
-        map_pad = Path(instellingen["data_dir"])
-        map_pad.mkdir(parents=True, exist_ok=True)
-        store = Store(map_pad / "bridge.sqlite3")
+        store = Store(_schrijfbare_datamap(instellingen["data_dir"]) / "bridge.sqlite3")
     if queue is None:
         queue = ImportQueue(store, client, delay=instellingen["delay"])
 

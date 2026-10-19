@@ -1,0 +1,64 @@
+# Tandoor Bridge als Custom App in TrueNAS.
+#
+#   Apps → Discover Apps → Custom App → Install via YAML
+#
+# Maak de dataset VOORAF aan. TrueNAS kan de wizard niet halverwege verlaten
+# om nog opslag aan te maken, en een Custom App die je via het formulier
+# installeert is daarna niet meer als YAML te bewerken.
+#
+# Drie dingen aanpassen voordat je dit plakt:
+#   1. het pad bij volumes (jouw pool en dataset)
+#   2. TANDOOR_URL — het adres waarop de NAS je Tandoor kan bereiken
+#   3. TANDOOR_TOKEN — uit Tandoor: Instellingen → API, scope "read write"
+#
+# Let op: het token staat hier in leesbare vorm en TrueNAS bewaart deze YAML
+# bij de app-configuratie. Wie bij de TrueNAS-interface kan, kan het dus
+# lezen. Voor een NAS op je eigen netwerk is dat meestal goed; ga ervan uit
+# dat het token niet geheim is voor wie op je NAS kan inloggen.
+
+services:
+  tandoor-bridge:
+    image: ghcr.io/bnieuwenhuijs/tandoor-bridge:latest
+    restart: unless-stopped
+
+    # 568 is de apps-gebruiker van TrueNAS. De dataset bij volumes moet van
+    # die gebruiker zijn, anders kan de brug z'n database niet aanmaken.
+    # Draai je liever met de gebruiker uit het image (uid 10001), haal deze
+    # regel dan weg en geef de dataset met chown -R 10001:10001 aan hem.
+    # De brug zegt bij de start precies welke uid hij is als het misgaat.
+    user: "568:568"
+
+    environment:
+      TANDOOR_URL: "http://192.168.1.130:30290"
+      TANDOOR_TOKEN: "tda_vul_hier_je_eigen_token_in"
+
+      # Voor de links in de interface, bijvoorbeeld je Tailscale-adres.
+      # Leeg laten betekent: gebruik TANDOOR_URL.
+      TANDOOR_PUBLIC_URL: ""
+
+      PORT: "8095"
+      IMPORT_DELAY_SECONDS: "5"
+      DATA_DIR: "/data"
+      SEND_PROPERTIES: "false"
+      LOG_LEVEL: "INFO"
+
+    ports:
+      - "8095:8095"
+
+    volumes:
+      # Een pad op de host, zodat de geschiedenis in een dataset staat die
+      # meegaat in je snapshots. Pas <pool> aan.
+      #
+      # Een Docker-volume kan ook (- bridgedata:/data plus een volumes-blok
+      # onderaan); dan hoef je niets te chownen omdat Docker het eigendom uit
+      # het image overneemt, maar dan moet de regel user: hierboven weg én
+      # valt de map buiten je snapshots.
+      - /mnt/<pool>/apps/tandoor-bridge/data:/data
+
+    logging:
+      # Zonder grens groeien de logs van een container die maanden draait door
+      # tot ze de schijf vullen.
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

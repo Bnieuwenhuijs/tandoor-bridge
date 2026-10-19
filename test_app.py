@@ -233,3 +233,24 @@ def test_van_bericht_tot_recept_in_tandoor(brug, tandoor, monkeypatch):
     assert item["title"] == "Kip korma met spinazie"
     assert item["tandoor_url"].endswith("/recipe/1")
     assert tandoor.state()["recipes"][0]["source_url"] == AH_URL
+
+
+def test_een_onschrijfbare_datamap_zegt_wat_eraan_te_doen(tmp_path, client):
+    """
+    Bij het inrichten op een NAS is dit de eerste fout die langskomt: de
+    container draait niet als root en de gekoppelde map is van iemand anders.
+    De melding moet zeggen wat je eraan doet, niet alleen dat het misging.
+    """
+    obstakel = tmp_path / "bestand"
+    obstakel.write_text("ik ben geen map")
+
+    with pytest.raises(RuntimeError) as fout:
+        create_app(client=client, start_worker=False,
+                   config={**__import__("app").config_from_env(),
+                           "data_dir": str(obstakel / "data"),
+                           "delay": 0, "send_properties": False,
+                           "public_url": None})
+    melding = str(fout.value)
+    assert "kan niet schrijven" in melding
+    assert "uid" in melding
+    assert "chown" in melding

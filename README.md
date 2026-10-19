@@ -88,6 +88,46 @@ de NAS zonder inloggen.
 Zelf bouwen in plaats van pullen kan ook: haal de regel `image:` uit
 `docker-compose.yml` en zet er `build: .` voor in de plaats.
 
+## Installeren op TrueNAS
+
+TrueNAS draait sinds versie 24.10 (Electric Eel) op Docker in plaats van
+Kubernetes, en heeft dan **Apps → Discover Apps → Custom App → Install via
+YAML**: een editor waarin je een compose-bestand plakt. `truenas-app.yaml` in
+deze repo is daarvoor klaargemaakt.
+
+De `docker-compose.yml` hierboven werkt daar *niet* rechtstreeks: `env_file:
+.env` heeft geen bestand om te lezen, en het relatieve pad `./data` bestaat
+niet in die context. In `truenas-app.yaml` staan de variabelen daarom direct
+in de YAML en het volume als absoluut pad.
+
+1. **Maak eerst de dataset aan**, bijvoorbeeld
+   `/mnt/<pool>/apps/tandoor-bridge/data`. TrueNAS kan de wizard niet
+   halverwege verlaten om nog opslag te maken.
+2. Geef die dataset aan de apps-gebruiker (uid/gid **568**). Dat is op TrueNAS
+   de gebruiker waaronder apps draaien, en `truenas-app.yaml` zet
+   `user: "568:568"` zodat de brug als diezelfde gebruiker draait.
+3. Plak `truenas-app.yaml`, pas het pad, `TANDOOR_URL` en `TANDOOR_TOKEN` aan,
+   en installeer.
+
+> Kies de YAML-route en niet het formulier: een Custom App die je via het
+> formulier installeert, is daarna alleen nog via dat formulier te bewerken.
+> Met de YAML-route houd je de editor.
+
+**Gaat het bij de eerste start mis op de dataset,** dan zegt de brug precies
+wat eraan te doen is, inclusief de uid waaronder hij draait:
+
+```
+RuntimeError: kan niet schrijven in /data (deze container draait als uid 568,
+gid 568): Permission denied. Geef die map eigendom aan deze gebruiker
+(chown -R 568:568 <pad op de host>), of laat de container als de eigenaar van
+die map draaien met user: "<uid>:<gid>" in docker-compose.yml, of gebruik een
+Docker-volume in plaats van een pad op de host.
+```
+
+Een Docker-volume in plaats van een pad op de host kan ook. Dan hoef je niets
+te chownen — Docker neemt het eigendom over uit het image — maar dan moet de
+regel `user:` weg, en staat de map buiten je snapshots.
+
 ## Een Tandoor-token maken
 
 In Tandoor: **Instellingen → API → nieuw token**, met scope `read write`. Het
