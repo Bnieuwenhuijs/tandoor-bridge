@@ -17,12 +17,16 @@ from werkzeug.serving import make_server
 
 from mock_tandoor import create_app
 from tandoor import (
+    DJANGO_BODY_LIMIT,
     TandoorClient,
     TandoorError,
     TandoorNoRecipe,
     TandoorThrottled,
     escape_for_data,
     image_suffix,
+    prepare_data,
+    recipe_payload,
+    sanitise_html,
     with_canonical,
 )
 
@@ -80,11 +84,24 @@ def test_escape_for_data_is_omkeerbaar():
         assert unquote(escape_for_data(stuk)) == stuk
 
 
-def test_html_komt_byte_voor_byte_bij_tandoor_aan(client, tandoor):
+def test_html_komt_onverminkt_bij_tandoor_aan(client, tandoor):
+    """
+    Wat Tandoor parseert is wat wij ophaalden - met één uitzondering die niet
+    in de documentatie staat: het veld 'data' is een DRF CharField met
+    trim_whitespace, dus de witruimte aan begin en eind gaat eraf. De brug
+    stript daarom zelf, zodat wat hij verstuurt gelijk is aan wat Tandoor
+    leest, en deze vergelijking niet liegt.
+    """
     client.recipe_from_source(AH_URL, AH_HTML)
     aangekomen = mock_state(tandoor)["last_data_decoded"]
-    # Precies de pagina die wij ophaalden, met alleen onze canonical ervoor.
-    assert aangekomen == with_canonical(AH_HTML, AH_URL)
+    assert aangekomen == with_canonical(sanitise_html(AH_HTML), AH_URL)
+
+    # Haal onze eigen canonical er weer uit, en wat overblijft is de pagina
+    # zoals de site hem gaf - geen enkele andere wijziging.
+    zonder_onze_tag = aangekomen.replace(
+        f'<link rel="canonical" href="{AH_URL}">', "", 1)
+    assert zonder_onze_tag == AH_HTML.strip()
+
     # En de afbeeldings-URL's zijn niet stilletjes gedecodeerd.
     assert "product%2FAHI_43545239%2Fkip-korma.jpg" in aangekomen
 
@@ -232,12 +249,19 @@ def test_pagina_zonder_recept(client):
     assert fout.value.message == "No usable data could be found."
 
 
-def test_ongeldig_token(tandoor):
+def test_ongeldig_token_geeft_403_en_niet_401(tandoor):
+    """
+    Tandoor geeft nooit een 401. SessionAuthentication staat vooraan in
+    DEFAULT_AUTHENTICATION_CLASSES en z'n authenticate_header() geeft None,
+    waarna DRF elke 401 tot een 403 herschrijft. Een verkeerd token en een
+    token zonder de scope 'read write' zijn dus niet te onderscheiden - dus
+    noemt de foutmelding ze beide.
+    """
     client = TandoorClient(tandoor.url, "verkeerd_token")
     with pytest.raises(TandoorError) as fout:
         client.check_connection()
-    assert fout.value.status == 401
-    assert fout.value.message == "Invalid token."
+    assert fout.value.status == 403
+    assert "read write" in fout.value.message
 
 
 def test_recept_zonder_naam_geeft_validatiefout(client):
@@ -319,10 +343,12 @@ def test_avif_wordt_geweigerd_met_uitleg():
         image_suffix("image/avif", b"\x00\x00\x00 ftypavif")
 
 
-def test_upload_zonder_geldige_naam_wordt_door_tandoor_geweigerd(client, tandoor):
+def test_upload_zonder_geldige_naam_geeft_een_serverfout(client, tandoor):
     """
-    Bewijst dat de naamcontrole echt bestaat: dit is wat er gebeurt als je
-    zonder achtervoegsel uploadt.
+    Dit is waarom image_suffix() bestaat. is_file_type_allowed() keurt op
+    bestandsnaam; de serializer geeft bij afkeuring None terug uit update(),
+    en daar rekent de view niet op. Het resultaat is geen nette 400 maar een
+    500 - een upload zonder achtervoegsel kost dus een serverfout.
     """
     bron = client.recipe_from_source(AH_URL, AH_HTML)
     recept = client.create_recipe(bron.recipe, source_url=AH_URL)
@@ -331,7 +357,7 @@ def test_upload_zonder_geldige_naam_wordt_door_tandoor_geweigerd(client, tandoor
         files={"image": ("image", JPEG, "image/jpeg")},
         headers={"Authorization": "Bearer tda_testtoken"},
     )
-    assert antwoord.status_code == 400
+    assert antwoord.status_code == 500
 
 
 def test_json_naar_het_afbeeldingsendpoint_wordt_geweigerd(client, tandoor):
@@ -344,3 +370,97 @@ def test_json_naar_het_afbeeldingsendpoint_wordt_geweigerd(client, tandoor):
         headers={"Authorization": "Bearer tda_testtoken"},
     )
     assert antwoord.status_code == 415
+
+
+# ------------------------------------------------- het antwoord klaarzetten
+
+def test_onbewerkt_terugposten_wordt_geweigerd(client, tandoor):
+    """
+    De blocker die de documentatie niet noemt. Het antwoord van
+    recipe-from-source zet 'order' op null in elk ingrediënt, maar
+    Ingredient.order is IntegerField(default=0) zonder null=True. Wie het
+    antwoord onbewerkt terugpost, krijgt een 400.
+    """
+    bron = client.recipe_from_source(AH_URL, AH_HTML)
+    assert bron.recipe["steps"][0]["ingredients"][0]["order"] is None
+
+    rechtstreeks = requests.post(
+        f"{tandoor.url}/api/recipe/", json=bron.recipe,
+        headers={"Authorization": "Bearer tda_testtoken"},
+    )
+    assert rechtstreeks.status_code == 400
+    assert rechtstreeks.json()["steps"][0]["ingredients"][0]["order"] == [
+        "This field may not be null."
+    ]
+
+    # En zo doet de brug het wel.
+    recept = client.create_recipe(bron.recipe, source_url=AH_URL)
+    assert recept["id"]
+
+
+def test_order_null_wordt_weggelaten():
+    bron = {"name": "x", "steps": [{"instruction": "a", "ingredients": [
+        {"amount": 1.0, "food": {"name": "ui"}, "unit": None, "order": None},
+        {"amount": 2.0, "food": {"name": "zout"}, "unit": None, "order": 3},
+    ]}]}
+    payload = recipe_payload(bron, "https://x.nl/r")
+    ingredienten = payload["steps"][0]["ingredients"]
+    assert "order" not in ingredienten[0]   # Tandoor gebruikt z'n default 0
+    assert ingredienten[1]["order"] == 3     # een echte waarde blijft staan
+
+
+def test_servings_null_wordt_weggelaten():
+    payload = recipe_payload({"name": "x", "servings": None, "servings_text": "None"},
+                             "https://x.nl/r")
+    assert "servings" not in payload
+    assert "servings_text" not in payload
+
+
+def test_pagina_zonder_porties_komt_er_toch_in(client, tandoor):
+    """Een recept zonder recipeYield gaf anders een 400 op servings."""
+    zonder = AH_HTML.replace('"recipeYield": "4 personen",', "")
+    bron = client.recipe_from_source(AH_URL, zonder)
+    assert bron.recipe["servings"] is None
+    recept = client.create_recipe(bron.recipe, source_url=AH_URL)
+    assert recept["id"]
+
+
+def test_properties_blijven_standaard_thuis():
+    """
+    property_type is een directe FK en drf-writable-nested voert die in
+    UPDATE-stand uit: de naam uit de body wordt op het bestaande PropertyType
+    geschreven. De brug blijft van de inrichting van de ruimte af.
+    """
+    bron = {"name": "x", "properties": [{"property_type": {"id": 3, "name": "Energie"},
+                                         "property_amount": 210}]}
+    assert "properties" not in recipe_payload(bron, "https://x.nl/r")
+    assert "properties" in recipe_payload(bron, "https://x.nl/r", send_properties=True)
+
+
+def test_image_url_gaat_niet_mee():
+    """Geen veld van het recept-model; de foto gaat via het image-endpoint."""
+    payload = recipe_payload({"name": "x", "image_url": "https://x.nl/f.jpg"}, "https://x.nl/r")
+    assert "image_url" not in payload
+
+
+def test_nul_byte_en_losse_surrogate_gaan_eruit():
+    """Beide zouden het serializerveld een 400 laten geven."""
+    assert "\x00" not in sanitise_html("<html>\x00kip</html>")
+    opgeschoond = sanitise_html("<html>" + chr(0xD800) + "kip</html>")
+    opgeschoond.encode("utf-8")  # mag niet meer klappen
+    assert "kip" in opgeschoond
+
+
+def test_te_grote_pagina_wordt_tegengehouden(client):
+    """
+    Django neemt niet meer dan 2,5 MB aan en antwoordt dan met gewone HTML in
+    plaats van een melding. Beter hier een leesbare fout.
+    """
+    reus = "<html><head></head><body>" + "x" * (DJANGO_BODY_LIMIT + 1) + "</body></html>"
+    with pytest.raises(TandoorError, match="te groot voor Tandoor"):
+        client.recipe_from_source(AH_URL, reus)
+
+
+def test_prepare_data_blijft_omkeerbaar():
+    assert unquote(prepare_data(AH_HTML, AH_URL)) == with_canonical(
+        sanitise_html(AH_HTML), AH_URL)

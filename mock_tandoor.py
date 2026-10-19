@@ -109,18 +109,26 @@ def _canonical_url(html, org_url):
 
 
 def _ingredient(regel):
-    """Grove benadering van Tandoors ingrediëntparser; alleen de vorm telt."""
+    """
+    Grove benadering van Tandoors ingrediëntparser; alleen de vorm telt.
+
+    Twee details zijn wél letterlijk overgenomen, omdat een client er precies
+    daarop struikelt: 'order' is in het antwoord altijd null (het veld is
+    allow_null en get_from_scraper zet het nooit), en 'unit' is null zodra er
+    geen eenheid herkend wordt. Teruggepost op POST /api/recipe/ geeft die
+    order een 400.
+    """
     match = _HOEVEELHEID_RE.match(str(regel))
     if not match:
-        return {"amount": 0, "food": {"name": str(regel).strip()}, "unit": {"name": ""},
-                "note": "", "order": 0, "original_text": str(regel)}
+        return {"amount": 0.0, "food": {"name": str(regel).strip()}, "unit": None,
+                "note": "", "order": None, "original_text": str(regel)}
     hoeveelheid, eenheid, rest = match.groups()
     return {
         "amount": float(hoeveelheid.replace(",", ".")),
         "food": {"name": (rest or "").strip()},
-        "unit": {"name": (eenheid or "").lower()},
+        "unit": {"name": eenheid.lower()} if eenheid else None,
         "note": "",
-        "order": 0,
+        "order": None,
         "original_text": str(regel),
     }
 
@@ -189,8 +197,8 @@ def _build_recipe(schema, html, source_url):
         "source_url": source_url,
         "name": naam[:128],
         "description": (schema.get("description") or "")[:256],
-        "servings": int(aantal.group()) if aantal else 1,
-        "servings_text": "",
+        "servings": int(aantal.group()) if aantal else None,
+        "servings_text": "" if porties else "None",
         "working_time": _minuten(schema.get("prepTime")),
         "waiting_time": _minuten(schema.get("cookTime")),
         "image_url": afbeelding,
@@ -214,14 +222,21 @@ def create_app(*, throttle_after=0, retry_after=5, token_prefix="tda_"):
     app.state = state
 
     def auth_fout():
+        """
+        Let op de statuscode: de echte Tandoor geeft nooit een 401.
+
+        SessionAuthentication staat vooraan in
+        DEFAULT_AUTHENTICATION_CLASSES en z'n authenticate_header() geeft
+        None, waarna DRF elke NotAuthenticated tot een 403 herschrijft. Een
+        ontbrekend token, een verkeerd token en een token zonder de juiste
+        scope zijn voor een client dus niet van elkaar te onderscheiden.
+        """
         kop = request.headers.get("Authorization", "")
-        if not kop:
-            return jsonify({"detail": "Authentication credentials were not provided."}), 401
         if not kop.startswith("Bearer "):
-            return jsonify({"detail": "Authentication credentials were not provided."}), 401
+            return jsonify({"detail": "Authentication credentials were not provided."}), 403
         token = kop[len("Bearer "):].strip()
         if not token.startswith(state.token_prefix):
-            return jsonify({"detail": "Invalid token."}), 401
+            return jsonify({"detail": "Authentication credentials were not provided."}), 403
         return None
 
     @app.before_request
@@ -246,8 +261,22 @@ def create_app(*, throttle_after=0, retry_after=5, token_prefix="tda_"):
         body = request.get_json(silent=True) or {}
         url = (body.get("url") or "").strip()
         state.last_data_raw = body.get("data") or ""
-        # Precies wat de echte view doet, en de reden dat de brug % beschermt.
-        data = unquote(state.last_data_raw)
+
+        # Het serializerveld draait vóór de unquote, en doet twee dingen die
+        # een client makkelijk over het hoofd ziet.
+        if "\x00" in state.last_data_raw:
+            return jsonify({"data": ["Null characters are not allowed."]}), 400
+        try:
+            state.last_data_raw.encode("utf-8")
+        except UnicodeEncodeError:
+            return jsonify({"data": ["Surrogate characters are not allowed."]}), 400
+        if len(url) > 4096:
+            return jsonify({"url": ["Ensure this field has no more than 4096 characters."]}), 400
+
+        # trim_whitespace staat standaard aan op een DRF CharField.
+        gestript = state.last_data_raw.strip()
+        # En dit is wat de echte view doet; de reden dat de brug % beschermt.
+        data = unquote(gestript)
         state.last_data_decoded = data
 
         if not url and not data:
@@ -299,6 +328,21 @@ def create_app(*, throttle_after=0, retry_after=5, token_prefix="tda_"):
         body = request.get_json(silent=True) or {}
         if not (body.get("name") or "").strip():
             return jsonify({"name": ["This field is required."]}), 400
+
+        # Recipe.servings is IntegerField(default=1), niet nullable - terwijl
+        # recipe-from-source hier null teruggeeft als de pagina geen porties
+        # noemt.
+        if "servings" in body and body["servings"] is None:
+            return jsonify({"servings": ["This field may not be null."]}), 400
+
+        # Ingredient.order is IntegerField(default=0), ook niet nullable,
+        # terwijl het antwoord van recipe-from-source er altijd null in zet.
+        # Dit is de 400 die je krijgt als je dat antwoord onbewerkt terugpost.
+        for stap in body.get("steps") or []:
+            for ingredient in (stap or {}).get("ingredients") or []:
+                if "order" in ingredient and ingredient["order"] is None:
+                    return jsonify({"steps": [{"ingredients": [
+                        {"order": ["This field may not be null."]}]}]}), 400
 
         recept = {sleutel: waarde for sleutel, waarde in body.items()
                   if sleutel not in ("id", "image", "created_by", "created_at",
@@ -353,9 +397,11 @@ def create_app(*, throttle_after=0, retry_after=5, token_prefix="tda_"):
 
         naam = (bestand.filename or "").lower()
         if not naam.endswith(ALLOWED_IMAGE_SUFFIXES):
-            # is_file_type_allowed() keurt op naam; de echte serializer geeft
-            # dan None terug en slaat niets op.
-            return jsonify({"image": ["Bestandstype niet toegestaan."]}), 400
+            # is_file_type_allowed() keurt op naam. De serializer geeft dan
+            # None terug uit update(), en daar rekent de view niet op: het
+            # resultaat is een 500, geen nette 400. Een upload met een naam
+            # zonder achtervoegsel kost dus een serverfout.
+            return jsonify({"detail": "A server error occurred."}), 500
 
         state.images[recipe_id] = (bestand.filename, bestand.read())
         state.recipes[recipe_id]["image"] = f"/media/recipes/{recipe_id}{naam[naam.rfind('.'):]}"

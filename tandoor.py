@@ -36,18 +36,53 @@ log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------- HTML klaarzetten
 
+# Django's DATA_UPLOAD_MAX_MEMORY_SIZE, die Tandoor niet overschrijft. Gaat de
+# body hier voorbij, dan gooit Django een RequestDataTooBig nog voordat DRF
+# hem ziet - en het antwoord is dan gewone HTML, geen JSON met een melding.
+DJANGO_BODY_LIMIT = 2_621_440
+
+
+def sanitise_html(html: str) -> str:
+    """
+    Haal eruit wat het serializerveld van Tandoor niet aanneemt.
+
+    Het veld 'data' is een gewone DRF CharField, en die draait vóór de
+    unquote(). Twee gevolgen, en geen van beide staat in de documentatie:
+
+    * trim_whitespace staat standaard aan, dus Tandoor strijkt de witruimte
+      aan het begin en eind er zelf af. Wij doen dat hier dus ook, anders
+      verstuurt de brug iets anders dan Tandoor parseert en liegt de test die
+      dat vergelijkt.
+    * ProhibitNullCharactersValidator en ProhibitSurrogateCharactersValidator
+      weigeren een NUL-byte of een losse surrogate met een 400. Eén kapot
+      teken in een pagina zou dus het hele recept kosten.
+    """
+    html = html.strip()
+    if "\x00" in html:
+        html = html.replace("\x00", "")
+    try:
+        html.encode("utf-8")
+    except UnicodeEncodeError:
+        # Losse surrogates: komen voor in slecht gecodeerde pagina's.
+        html = html.encode("utf-8", "ignore").decode("utf-8")
+    return html
+
+
 def escape_for_data(html: str) -> str:
     """
     Bescherm de HTML tegen de unquote() die Tandoor erover haalt.
 
     Die sloopt stil elke %XX-reeks in de pagina: %2F wordt /, %20 wordt een
-    spatie. Omdat unquote (en niet unquote_plus) alleen naar %XX kijkt, is het
-    procentteken zelf het enige dat bescherming nodig heeft. De rest blijft
-    byte voor byte staan en de pagina wordt niet groter - wat telt, want
-    Tandoor zet geen eigen DATA_UPLOAD_MAX_MEMORY_SIZE en Django neemt
-    standaard niet meer dan 2,5 MB aan formuliergegevens aan.
+    spatie. Omdat het unquote is en niet unquote_plus, is het procentteken
+    zelf het enige dat bescherming nodig heeft; een + blijft gewoon staan. De
+    pagina wordt er niet groter van, wat telt vanwege DJANGO_BODY_LIMIT.
     """
     return html.replace("%", "%25")
+
+
+def prepare_data(html: str, url: str) -> str:
+    """De HTML zoals hij het veld 'data' in gaat."""
+    return escape_for_data(with_canonical(sanitise_html(html), url))
 
 
 _CANONICAL_TAG_RE = re.compile(r"""<link\b[^>]*\brel\s*=\s*["']?canonical\b["']?[^>]*>""", re.I)
@@ -125,6 +160,68 @@ def image_suffix(content_type: str, content: bytes = b"") -> str:
         f"Tandoor accepteert dit beeldformaat niet ({content_type or 'onbekend'}); "
         "alleen jpg, png, gif en webp"
     )
+
+
+# ---------------------------------------------------------------- recept klaarzetten
+
+def recipe_payload(recipe: dict, source_url: str, *, send_properties: bool = False) -> dict:
+    """
+    Maak van het recipe-object uit stap 1 iets dat POST /api/recipe/ aanneemt.
+
+    Het antwoord van recipe-from-source is niet hetzelfde model als het
+    recept-model, en twee velden komen er in een vorm uit die het aanmaken
+    met een 400 afwijst. Dat is geen theorie: beide staan in het antwoord van
+    elk recept dat de brug ophaalt.
+
+    * ingredients[].order is in het antwoord altijd null, omdat
+      SourceImportIngredientSerializer het veld als allow_null declareert en
+      get_from_scraper het nooit zet. Maar Ingredient.order is
+      IntegerField(default=0) zonder null=True, dus bij het aanmaken geeft
+      null "This field may not be null." Het veld eruit laten betekent dat
+      Tandoor z'n eigen default gebruikt.
+    * servings kan null zijn als de pagina geen porties noemt
+      (parse_servings geeft dan None), terwijl Recipe.servings
+      IntegerField(default=1) is - ook niet nullable.
+
+    Verder weggelaten:
+
+    * image_url hoort niet bij het recept-model en wordt genegeerd; de foto
+      gaat via PUT /api/recipe/{id}/image/.
+    * properties, tenzij uitdrukkelijk gevraagd. property_type is een directe
+      FK, en drf-writable-nested voert die in UPDATE-stand uit: de naam uit
+      de body wordt op het bestaande PropertyType geschreven. In de praktijk
+      is dat dezelfde naam, maar het blijft een schrijfactie op de inrichting
+      van de ruimte, en daar blijft de brug van af.
+    * servings_text met de letterlijke tekst "None", wat parse_servings_text
+      oplevert bij een pagina zonder porties.
+    """
+    payload = {sleutel: waarde for sleutel, waarde in recipe.items()
+               if sleutel not in ("id", "image", "image_url")}
+    payload["source_url"] = source_url
+
+    if not send_properties:
+        payload.pop("properties", None)
+
+    if payload.get("servings") is None:
+        payload.pop("servings", None)
+    if payload.get("servings_text") in (None, "None"):
+        payload.pop("servings_text", None)
+    if payload.get("description") == "None":
+        payload["description"] = ""
+
+    stappen = []
+    for stap in payload.get("steps") or []:
+        stap = dict(stap)
+        stap["ingredients"] = [
+            {s: w for s, w in (ingredient or {}).items()
+             if not (s == "order" and w is None)}
+            for ingredient in (stap.get("ingredients") or [])
+        ]
+        stappen.append(stap)
+    if stappen:
+        payload["steps"] = stappen
+
+    return payload
 
 
 # ---------------------------------------------------------------- fouten
@@ -220,7 +317,7 @@ class TandoorClient:
 
     def __init__(self, base_url: str, token: str, *, public_url: str | None = None,
                  timeout=(5, 30), max_retries: int = 3, max_throttle_wait: int = 120,
-                 sleep=time.sleep):
+                 send_properties: bool = False, sleep=time.sleep):
         if not base_url:
             raise ValueError("TANDOOR_URL is leeg")
         if not token:
@@ -230,6 +327,7 @@ class TandoorClient:
         self._timeout = timeout
         self._max_retries = max_retries
         self._max_throttle_wait = max_throttle_wait
+        self.send_properties = send_properties
         self._sleep = sleep
         self._session = requests.Session()
         self._session.headers.update({
@@ -279,8 +377,16 @@ class TandoorClient:
                 continue
 
             payload = _payload(resp)
-            raise TandoorError(_message_from(payload, resp.status_code),
-                               status=resp.status_code, payload=payload)
+            melding = _message_from(payload, resp.status_code)
+            if resp.status_code == 403:
+                # Tandoor geeft nooit een 401: SessionAuthentication staat
+                # vooraan in DEFAULT_AUTHENTICATION_CLASSES en z'n
+                # authenticate_header() geeft None, waarna DRF elke 401 tot
+                # een 403 herschrijft. Een verkeerd token en een token zonder
+                # de scope "read write" zien er dus identiek uit.
+                melding = (f"{melding} (controleer TANDOOR_TOKEN en of het token "
+                           f"de scope 'read write' heeft)")
+            raise TandoorError(melding, status=resp.status_code, payload=payload)
 
         raise laatste or TandoorError("onbekende fout bij Tandoor")
 
@@ -293,7 +399,13 @@ class TandoorClient:
         De url gaat mee náást de data: Tandoor haalt de pagina dan nog steeds
         niet zelf op, maar vult wel 'duplicates' op basis van source_url.
         """
-        body = {"url": url, "data": escape_for_data(with_canonical(html, url))}
+        data = prepare_data(html, url)
+        if len(data.encode("utf-8")) > DJANGO_BODY_LIMIT - 4096:
+            raise TandoorError(
+                f"de pagina is te groot voor Tandoor ({len(data) // 1024} KB; "
+                f"de grens ligt bij {DJANGO_BODY_LIMIT // 1024} KB)"
+            )
+        body = {"url": url, "data": data}
         try:
             payload = self._request("POST", "/api/recipe-from-source/", json=body, ok=(200,))
         except TandoorError as e:
@@ -326,9 +438,7 @@ class TandoorClient:
         de eigen importpagina dat doet; alleen source_url zetten we zelf, op
         exact de opgeschoonde URL die ook onze dubbel-sleutel is.
         """
-        body = dict(recipe)
-        body["source_url"] = source_url
-        body.pop("id", None)
+        body = recipe_payload(recipe, source_url, send_properties=self.send_properties)
         aangemaakt = self._request("POST", "/api/recipe/", json=body, ok=(200, 201))
         if not aangemaakt.get("id"):
             raise TandoorError("Tandoor gaf geen id terug bij het aanmaken van het recept")
