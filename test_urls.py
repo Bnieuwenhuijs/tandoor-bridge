@@ -147,3 +147,27 @@ def test_lege_invoer():
     assert extract_urls(None) == []
     assert extract_urls("geen enkele link hier") == []
     assert normalize_url("") == ""
+
+
+def test_eigen_netwerk_houdt_http():
+    """
+    Een adres op het eigen netwerk heeft zelden een geldig certificaat.
+    Zonder deze uitzondering is een zelf gehoste receptensite op de NAS niet
+    te importeren.
+    """
+    for url in [
+        "http://127.0.0.1:8098/recept.html",
+        "http://192.168.1.130:30290/recipe/5",
+        "http://nas.local/recepten/soep",
+        "http://tail2bbdeb.ts.net:30290/recipe/5",
+    ]:
+        assert normalize_url(url) == url
+
+    # En een gewone site wordt nog steeds opgewaardeerd.
+    assert normalize_url("http://www.ah.nl/allerhande/recept/R-R1").startswith("https://")
+
+
+def test_een_link_zonder_host_levert_niets_op():
+    """Beter niets dan een onzinnige URL in de wachtrij."""
+    assert normalize_url("ah.nl/r/123") == ""
+    assert normalize_url("gewoon wat tekst") == ""

@@ -43,6 +43,23 @@ _HOST_REWRITES = {
     "mobiel.voedingscentrum.nl": "www.voedingscentrum.nl",
 }
 
+# http wordt https, maar niet voor adressen op het eigen netwerk: die hebben
+# zelden een geldig certificaat. Zonder deze uitzondering is een zelf
+# gehoste receptensite op de NAS niet te importeren - en de rooktest niet
+# tegen een lokale pagina te draaien.
+_PRIVATE_HOST_RE = re.compile(
+    r"""^(
+        localhost
+      | 127\.\d+\.\d+\.\d+
+      | 10\.\d+\.\d+\.\d+
+      | 192\.168\.\d+\.\d+
+      | 172\.(1[6-9]|2\d|3[01])\.\d+\.\d+
+      | \[::1\]
+      | .+\.(local|lan|home|internal|ts\.net)
+    )$""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
 
 def _trim_trailing(url: str) -> str:
     """Interpunctie afknippen die bij de zin hoort, niet bij de link."""
@@ -81,9 +98,17 @@ def normalize_url(url: str) -> str:
         return ""
 
     parts = urlsplit(url)
+    if not parts.netloc:
+        # Zonder scheme en host valt er niets op te halen. Beter nu niets
+        # teruggeven dan straks een onzinnige URL in de wachtrij.
+        return ""
+
     host = parts.netloc.lower()
     host = _HOST_REWRITES.get(host, host)
     path, query = parts.path, parts.query
+
+    hostnaam = host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+    scheme = parts.scheme.lower() if _PRIVATE_HOST_RE.match(hostnaam) else "https"
 
     if host.endswith("ah.nl"):
         if short := _AH_SHORT_PATH_RE.match(path):
@@ -93,7 +118,7 @@ def normalize_url(url: str) -> str:
 
     # Het fragment (#ingredienten) wijst naar een stuk van dezelfde pagina en
     # zegt niets over welk recept het is.
-    return urlunsplit(("https", host, path, _clean_query(query), ""))
+    return urlunsplit((scheme or "https", host, path, _clean_query(query), ""))
 
 
 def dedupe_key(url: str) -> str:
