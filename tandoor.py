@@ -33,6 +33,8 @@ from html import escape
 
 import requests
 
+from fetcher import describe_page
+
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------- HTML klaarzetten
@@ -256,6 +258,16 @@ class TandoorUnreachable(TandoorError):
     """Tandoor antwoordde niet. Meestal tijdelijk, dus geen eindoordeel."""
 
 
+class NoRecipeSchema(TandoorNoRecipe):
+    """
+    Wij zagen al dat er geen recept in de pagina staat.
+
+    Apart van TandoorNoRecipe omdat Tandoor hier niets van gezien heeft: de
+    melding komt van ons, en de wachtrij hoort hem niet aan Tandoor toe te
+    schrijven.
+    """
+
+
 class TandoorThrottled(TandoorError):
     """De importlimiet is bereikt; na retry_after seconden mag het weer."""
 
@@ -309,6 +321,19 @@ def _message_from(payload: dict, status: int) -> str:
     if velden:
         return "; ".join(velden[:3])
     return f"Tandoor gaf status {status}"
+
+
+def _geen_schema_melding(beschrijving: dict) -> str:
+    """Zeg wat er dan wél in de pagina stond; dat scheelt het zoeken."""
+    delen = [f"geen recept-schema in de pagina ({beschrijving['bytes'] // 1024} KB)"]
+    if beschrijving.get("titel"):
+        delen.append(f'titel: "{beschrijving["titel"]}"')
+    if beschrijving.get("lijkt_cookiemuur"):
+        delen.append("dit lijkt een cookiemelding, niet het recept")
+    elif beschrijving.get("lijkt_js_pagina"):
+        delen.append("de pagina bouwt zichzelf met JavaScript op, dus het "
+                     "schema staat niet in de ruwe HTML")
+    return "; ".join(delen)
 
 
 def _retry_after(resp) -> int:
@@ -440,6 +465,17 @@ class TandoorClient:
         De url gaat mee náást de data: Tandoor haalt de pagina dan nog steeds
         niet zelf op, maar vult wel 'duplicates' op basis van source_url.
         """
+        # Vooraf kijken of er iets te ontleden valt. Tandoor geeft bij een
+        # pagina zonder schema geen nette melding maar een 500: zijn data-tak
+        # vangt NoSchemaFoundInWildMode niet af, terwijl de url-tak dat wel
+        # doet. Dat kost een plaats in de limiet van 60 per uur en levert een
+        # foutmelding op die niets uitlegt. Dit is geen ingrediënten ontleden
+        # - het kijkt alleen of er een schema in de pagina staat.
+        beschrijving = describe_page(html)
+        if not beschrijving["heeft_schema"]:
+            raise NoRecipeSchema(_geen_schema_melding(beschrijving),
+                                 payload={"pagina": beschrijving})
+
         body = {"url": url, "data": prepare_data(html, url)}
 
         # Meten op de werkelijke body: JSON ontsnapt aanhalingstekens en

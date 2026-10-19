@@ -26,6 +26,7 @@ staat op een lijst".
 """
 
 import logging
+import re
 from dataclasses import dataclass
 
 import requests
@@ -124,6 +125,45 @@ def looks_like_bot_wall(status: int, body: str) -> str | None:
             if marker in laag:
                 return f"blokkadepagina met status 200 ({marker})"
     return None
+
+
+# De vormen waarin een recept in een pagina kan staan. recipe_scrapers leest
+# ze alle drie via extruct, dus het is niet genoeg om alleen naar ld+json te
+# kijken.
+_SCHEMA_MARKERS = (
+    'application/ld+json',
+    'itemtype="https://schema.org/recipe"',
+    "itemtype='https://schema.org/recipe'",
+    'itemtype="http://schema.org/recipe"',
+    "itemtype='http://schema.org/recipe'",
+)
+
+
+def describe_page(html: str) -> dict:
+    """
+    Wat zit er in deze pagina? Voor het stellen van een diagnose.
+
+    Dit ontleedt geen recept - het kijkt alleen of er iets te ontleden valt.
+    Tandoor geeft bij een pagina zonder schema namelijk een kale 500 (zijn
+    data-tak vangt NoSchemaFoundInWildMode niet af), en dan weet je nog niet
+    of de pagina leeg was, of een cookiemuur, of met JavaScript opgebouwd.
+    """
+    laag = html.lower()
+    titel = ""
+    if match := re.search(r"<title[^>]*>(.*?)</title>", html, re.I | re.S):
+        titel = re.sub(r"\s+", " ", match.group(1)).strip()[:200]
+    return {
+        "bytes": len(html),
+        "titel": titel,
+        "ld_json_blokken": laag.count("application/ld+json"),
+        "heeft_schema": any(m in laag for m in _SCHEMA_MARKERS),
+        "noemt_recipe": '"@type": "recipe"' in laag.replace(" ", "")
+                        or '"@type":"recipe"' in laag.replace(" ", ""),
+        "lijkt_cookiemuur": any(w in laag for w in (
+            "cookiemelding", "accepteer cookies", "cookie-instellingen",
+            "jouw privacy", "we gebruiken cookies", "accept all cookies")),
+        "lijkt_js_pagina": "__next_data__" in laag or "window.__nuxt__" in laag,
+    }
 
 
 def image_headers(referer: str | None = None) -> dict:

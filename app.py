@@ -254,6 +254,39 @@ def create_app(*, store=None, client=None, queue=None, start_worker=True,
             "tandoor": client.public_url,
         }), 200
 
+    @app.get("/api/diagnose")
+    def diagnose():
+        """
+        Haal één pagina op en zeg wat erin zit, zonder Tandoor erbij.
+
+        Dit is de knop voor "waarom lukt deze site niet": je ziet of de
+        aanvraag doorkwam, via welke poging, en of er een recept-schema in de
+        pagina staat.
+        """
+        from fetcher import FetchError, describe_page, fetch_page
+        from urls import normalize_url
+
+        url = normalize_url(request.args.get("url", ""))
+        if not url:
+            return jsonify({"error": "geef een url mee: /api/diagnose?url=..."}), 400
+        try:
+            pagina = fetch_page(url)
+        except FetchError as e:
+            return jsonify({"url": url, "ok": False, "reden": e.reason,
+                            "status": e.status}), 200
+        beschrijving = describe_page(pagina.html)
+        return jsonify({
+            "url": url,
+            "ok": True,
+            "via": pagina.via,
+            "status": pagina.status,
+            "final_url": pagina.final_url,
+            "pagina": beschrijving,
+            "verwachting": ("Tandoor kan dit ontleden" if beschrijving["heeft_schema"]
+                            else "Tandoor vindt hier geen recept"),
+            "begin": pagina.html[:600],
+        }), 200
+
     @app.get("/api/check")
     def check():
         """Werkt de verbinding met Tandoor? Voor de rooktest en de startpagina."""

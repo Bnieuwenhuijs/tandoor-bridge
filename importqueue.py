@@ -23,6 +23,7 @@ from urllib.parse import urljoin
 
 from fetcher import FetchError, fetch_image, fetch_page
 from tandoor import (
+    NoRecipeSchema,
     TandoorError,
     TandoorNoRecipe,
     TandoorThrottled,
@@ -392,6 +393,10 @@ class ImportQueue:
             return self._handle_throttle(item, e)
         except TandoorUnreachable as e:
             return self._handle_unreachable(item, e)
+        except NoRecipeSchema as e:
+            # Onze eigen voorcontrole; Tandoor heeft deze pagina nooit gezien.
+            self.store.update(item_id, status=MISLUKT, error=e.message)
+            return {"status": MISLUKT}
         except TandoorNoRecipe as e:
             self.store.update(item_id, status=MISLUKT,
                               error=f"Tandoor vond geen recept: {e.message}")

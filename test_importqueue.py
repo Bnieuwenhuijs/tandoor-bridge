@@ -187,14 +187,32 @@ def test_een_fout_stopt_de_rest_niet(store, client):
     assert klaar[0]["recipe_id"] == 1
 
 
-def test_pagina_zonder_recept_krijgt_tandoors_eigen_melding(store, client):
+def test_pagina_zonder_schema_wordt_niet_naar_tandoor_gestuurd(store, client, tandoor):
+    """
+    Een pagina zonder recept-schema geeft bij Tandoor een kale 500, want zijn
+    data-tak vangt NoSchemaFoundInWildMode niet af. Die aanroep doen we dus
+    niet - hij kost een plaats in de limiet en zegt niets.
+    """
     queue = ImportQueue(store, client, delay=0,
-                        fetch=maak_fetch("<html><body>kattenfoto</body></html>"),
+                        fetch=maak_fetch("<html><head><title>Even geduld…</title>"
+                                         "</head><body>laden</body></html>"),
                         fetch_photo=maak_fotofetch())
     [item_id] = store.add([AH_URL]).added
 
     assert queue.process_once()["status"] == MISLUKT
-    # De melding van Tandoor, niet een eigen gok.
+    fout = store.item(item_id)["error"]
+    assert "geen recept-schema" in fout
+    assert "Even geduld" in fout                        # je ziet wát er kwam
+    assert "Tandoor vond geen recept" not in fout        # niet aan Tandoor toeschrijven
+    assert tandoor.state()["import_calls"] == 0
+
+
+def test_pagina_met_ander_schema_krijgt_tandoors_eigen_melding(store, client):
+    queue = ImportQueue(store, client, delay=0, fetch=maak_fetch('<html><head><title>Kattenfoto</title><script type="application/ld+json">{"@context":"https://schema.org","@type":"Article","name":"Kat"}</script></head><body>miauw</body></html>'),
+                        fetch_photo=maak_fotofetch())
+    [item_id] = store.add([AH_URL]).added
+
+    assert queue.process_once()["status"] == MISLUKT
     assert "No usable data could be found." in store.item(item_id)["error"]
 
 

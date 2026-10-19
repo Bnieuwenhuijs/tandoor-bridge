@@ -18,7 +18,7 @@ import argparse
 import os
 import sys
 
-from fetcher import FetchError, fetch_image, fetch_page
+from fetcher import FetchError, describe_page, fetch_image, fetch_page
 from tandoor import TandoorClient, TandoorError, TandoorNoRecipe, TandoorThrottled
 from urls import normalize_url
 
@@ -88,6 +88,23 @@ def main():
           f"(status {pagina.status})")
     if pagina.final_url != url:
         print(f"{INFO} doorgestuurd naar {pagina.final_url}")
+
+    beschrijving = describe_page(pagina.html)
+    print(f"{INFO} titel: {beschrijving['titel'] or '(geen)'}")
+    print(f"{INFO} ld+json-blokken: {beschrijving['ld_json_blokken']}")
+    if beschrijving["heeft_schema"]:
+        print(f"{GOED} er staat een recept-schema in de pagina")
+    else:
+        print(f"{FOUT} geen recept-schema in de pagina")
+        if beschrijving["lijkt_cookiemuur"]:
+            print(f"{INFO} dit lijkt een cookiemelding en niet het recept")
+        elif beschrijving["lijkt_js_pagina"]:
+            print(f"{INFO} de pagina bouwt zichzelf met JavaScript op, dus het "
+                  f"schema staat niet in de ruwe HTML")
+        afbreken("Tandoor kan hier niets mee; zie de README bij "
+                 "'een site blokkeert toch'",
+                 "Tandoor geeft op zo'n pagina een kale 500, want zijn "
+                 "data-tak vangt NoSchemaFoundInWildMode niet af")
 
     stap(4, "Tandoor laat ontleden")
     try:
