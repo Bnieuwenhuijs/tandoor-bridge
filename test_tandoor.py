@@ -429,3 +429,60 @@ def test_te_grote_pagina_wordt_tegengehouden(client):
 def test_prepare_data_blijft_omkeerbaar():
     assert unquote(prepare_data(AH_HTML, AH_URL)) == with_canonical(
         sanitise_html(AH_HTML), AH_URL)
+
+
+def test_een_500_wordt_niet_herhaald():
+    """
+    Een 500 komt uit Tandoor zelf en is bijna altijd deterministisch: dezelfde
+    pagina geeft dezelfde fout. Nog twee keer sturen kost drie plaatsen in de
+    importlimiet van 60 per uur en levert hetzelfde resultaat.
+    """
+    from flask import Flask, jsonify
+
+    app = Flask(__name__)
+    aanroepen = []
+
+    @app.post("/api/recipe-from-source/")
+    def stuk():
+        aanroepen.append(1)
+        return jsonify({"detail": "kapot"}), 500
+
+    from conftest import MockServer
+
+    server = MockServer(app)
+    geslapen = []
+    client = TandoorClient(server.url, "tda_x", sleep=geslapen.append)
+    try:
+        with pytest.raises(TandoorError) as fout:
+            client.recipe_from_source(AH_URL, AH_HTML)
+        assert len(aanroepen) == 1          # precies één keer
+        assert geslapen == []               # en niet gewacht
+        # En de melding wijst naar waar het antwoord zelf niets zegt.
+        assert "logboek van de Tandoor-container" in fout.value.message
+    finally:
+        server.stop()
+
+
+def test_een_503_wordt_wel_herhaald():
+    """Die hoort bij een herstart of een proxy ertussen, en gaat voorbij."""
+    from flask import Flask, jsonify
+
+    app = Flask(__name__)
+    aanroepen = []
+
+    @app.post("/api/recipe-from-source/")
+    def herstart():
+        aanroepen.append(1)
+        return jsonify({"detail": "even niet"}), 503
+
+    from conftest import MockServer
+    server = MockServer(app)
+    geslapen = []
+    client = TandoorClient(server.url, "tda_x", max_retries=3, sleep=geslapen.append)
+    try:
+        with pytest.raises(TandoorError):
+            client.recipe_from_source(AH_URL, AH_HTML)
+        assert len(aanroepen) == 3
+        assert geslapen == [2, 4]
+    finally:
+        server.stop()

@@ -244,6 +244,14 @@ class TandoorNoRecipe(TandoorError):
     """Tandoor kon in deze pagina geen recept vinden. Niet onze fout."""
 
 
+# Alleen statuscodes die bij een herstart of een proxy ertussen horen zijn
+# het opnieuw proberen waard. Een 500 komt uit Tandoor zelf en is bijna altijd
+# deterministisch: dezelfde pagina geeft dezelfde fout. Nog twee keer sturen
+# levert dus dezelfde 500 op, maar kost wel drie plaatsen in de importlimiet
+# van 60 per uur - een derde van je doorvoer, voor niets.
+RETRY_STATUSSEN = frozenset({502, 503, 504})
+
+
 class TandoorUnreachable(TandoorError):
     """Tandoor antwoordde niet. Meestal tijdelijk, dus geen eindoordeel."""
 
@@ -395,13 +403,22 @@ class TandoorClient:
             if resp.status_code in ok:
                 return _payload(resp)
 
-            if 500 <= resp.status_code < 600 and poging < max_pogingen:
-                log.warning("Tandoor gaf %s, nog een poging", resp.status_code)
+            if resp.status_code in RETRY_STATUSSEN and poging < max_pogingen:
+                log.warning("Tandoor gaf %s (herstart of proxy?), nog een poging",
+                            resp.status_code)
                 self._sleep(2 ** poging)
                 continue
 
             payload = _payload(resp)
             melding = _message_from(payload, resp.status_code)
+            if 500 <= resp.status_code < 600:
+                # Een Django-fout met DEBUG=False stuurt gewone HTML terug
+                # zonder enige uitleg, dus hier is niets zinnigs uit te halen.
+                # De traceback staat in het logboek van Tandoor zelf, en daar
+                # moet je dus kijken - dat is niet vanzelf duidelijk.
+                melding = (f"Tandoor gaf een interne fout ({resp.status_code}). "
+                           f"De oorzaak staat in het logboek van de "
+                           f"Tandoor-container, niet in dit antwoord.")
             if resp.status_code == 403:
                 # Tandoor geeft nooit een 401: SessionAuthentication staat
                 # vooraan in DEFAULT_AUTHENTICATION_CLASSES en z'n
