@@ -89,19 +89,23 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  # Alleen nodig voor sites die elke server-side aanvraag weigeren, zoals
-  # Albert Heijn: Akamai zet z'n sensor-cookies pas nadat het JavaScript op de
-  # pagina gedraaid heeft, en dan is een echte browser wat er nog overblijft.
+  # Voor Albert Heijn is deze container niet meer nodig: die recepten gaan via
+  # de app-API van AH (zie de README bij "Albert Heijn: de app-API"). Hij
+  # blijft voor andere sites die hun recept pas met JavaScript opbouwen, of
+  # die een blokkade als gewone pagina teruggeven.
   #
   # De brug gebruikt hem alleen als de gewone pogingen falen of een pagina
-  # zonder recept opleveren. Haal deze service en RENDERER_URL weg als je geen
-  # AH importeert; dan blijft alleen de lichte container over.
+  # zonder recept opleveren. Haal deze service en RENDERER_URL weg als je hem
+  # niet nodig hebt; dan blijft alleen de lichte container over.
   #
   # De browser start pas bij het eerste verzoek en sluit zichzelf weer af na
   # BROWSER_IDLE_SECONDS zonder werk, dus tussen twee importrondes kost dit
   # geen geheugen.
   tandoor-bridge-renderer:
-    image: ghcr.io/bnieuwenhuijs/tandoor-bridge-renderer:claude-practical-johnson-jsrrgm
+    # :latest wordt alleen van main gebouwd. Staat de nieuwste wijziging nog in
+    # een pull request, zet dan tijdelijk de naam van de branch als tag -
+    # bijvoorbeeld :claude-practical-johnson-jsrrgm.
+    image: ghcr.io/bnieuwenhuijs/tandoor-bridge-renderer:latest
     pull_policy: always
     restart: unless-stopped
     environment:
