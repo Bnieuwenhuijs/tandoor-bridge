@@ -324,3 +324,28 @@ def test_diagnose_vergelijkt_de_manieren_van_ophalen(brug, monkeypatch):
 def test_diagnose_zonder_url(brug):
     http, _, _ = brug
     assert http.get("/api/diagnose").status_code == 400
+
+
+def test_status_zegt_of_de_browser_container_antwoordt(brug, monkeypatch):
+    """
+    Ingesteld zijn en antwoorden zijn twee verschillende dingen. Dat verschil
+    is wat je wil zien als Albert Heijn niet lukt.
+    """
+    http, _, _ = brug
+    import fetcher
+
+    monkeypatch.setattr(fetcher, "RENDERER_URL", "http://tandoor-bridge-renderer:8096")
+    monkeypatch.setattr(fetcher, "renderer_health", lambda url, timeout=3: False)
+    data = http.get("/api/status").get_json()
+    assert data["browser"] == "http://tandoor-bridge-renderer:8096"
+    assert data["browser_bereikbaar"] is False
+
+
+def test_status_zonder_browser_container(brug, monkeypatch):
+    http, _, _ = brug
+    import fetcher
+
+    monkeypatch.setattr(fetcher, "RENDERER_URL", "")
+    data = http.get("/api/status").get_json()
+    assert data["browser"] is None
+    assert data["browser_bereikbaar"] is None

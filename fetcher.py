@@ -257,8 +257,11 @@ def _attempt_renderer(url: str, *, timeout: int, renderer: str) -> _Attempt:
         resp = requests.post(f"{renderer}/render", json={"url": url},
                              timeout=(5, timeout + 60))
     except requests.RequestException as e:
-        return _Attempt(False, f"browser-container niet te bereiken "
-                               f"({e.__class__.__name__})")
+        # Dit is bijna altijd een deployment-oorzaak en niet een netwerkstoring,
+        # dus noem die: een kale ConnectionError stuurt je de verkeerde kant op.
+        return _Attempt(False, f"browser-container niet te bereiken op {renderer} "
+                               f"({e.__class__.__name__}) - draait die container, "
+                               f"en kon z'n image gepulld worden?")
     try:
         body = resp.json()
     except ValueError:
@@ -329,6 +332,23 @@ def fetch_page(url: str, *, timeout: int = 20, impersonate: bool = True,
         return gelukt
     raise FetchError("; ".join(redenen) or "geen enkele poging kwam door",
                      status=eerste_status)
+
+
+def renderer_health(renderer: str, *, timeout: int = 3) -> bool | None:
+    """
+    Antwoordt de browser-container? None als er geen is ingesteld.
+
+    Dat is iets anders dan "is hij ingesteld", en precies het verschil waar je
+    naar zoekt als Albert Heijn niet lukt.
+    """
+    renderer = (renderer or "").rstrip("/")
+    if not renderer:
+        return None
+    try:
+        resp = requests.get(f"{renderer}/healthz", timeout=timeout)
+        return resp.status_code == 200 and bool((resp.json() or {}).get("ok"))
+    except (requests.RequestException, ValueError):
+        return False
 
 
 def probe(url: str, *, timeout: int = 20) -> list:

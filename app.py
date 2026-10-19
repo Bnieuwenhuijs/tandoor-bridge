@@ -247,16 +247,17 @@ def create_app(*, store=None, client=None, queue=None, start_worker=True,
 
     @app.get("/api/status")
     def status():
-        from fetcher import RENDERER_URL
+        from fetcher import RENDERER_URL, renderer_health
 
         return jsonify({
             "counts": store.counts(),
             "worker": queue.running,
             "delay": queue.delay,
             "tandoor": client.public_url,
-            # Zodat je kunt zien of de browser-container is ingesteld: zonder
-            # die staat Albert Heijn je sowieso niet toe.
+            # Ingesteld zijn en antwoorden zijn twee verschillende dingen, en
+            # dat verschil is precies waar je naar zoekt als AH niet lukt.
             "browser": RENDERER_URL or None,
+            "browser_bereikbaar": renderer_health(RENDERER_URL),
         }), 200
 
     @app.get("/api/diagnose")
