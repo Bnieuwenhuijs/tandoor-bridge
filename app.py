@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 
 from flask import Flask, jsonify, render_template, request
+from markupsafe import escape
 
 from importqueue import ImportQueue, Store
 from tandoor import TandoorClient, TandoorError
@@ -108,6 +109,23 @@ def _schrijfbare_datamap(pad: str) -> Path:
     return map_pad
 
 
+def _bookmarklet_pagina(kop: str, tekst: str, link: str | None) -> str:
+    """Een klein antwoordpaginaatje; het opent in een nieuw tabblad."""
+    knop = (f'<p><a href="{escape(link)}">Bekijk in Tandoor</a></p>' if link else "")
+    return (
+        "<!DOCTYPE html><html lang=nl><head><meta charset=utf-8>"
+        "<meta name=viewport content='width=device-width,initial-scale=1'>"
+        "<title>Tandoor Bridge</title><style>"
+        "body{font:16px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,"
+        "sans-serif;margin:0;padding:32px;color-scheme:light dark}"
+        "h1{font-size:20px;margin:0 0 8px}p{margin:4px 0}"
+        "</style></head><body>"
+        f"<h1>{escape(kop)}</h1><p>{escape(tekst)}</p>{knop}"
+        "<p><small>Dit tabblad kun je sluiten.</small></p>"
+        "</body></html>"
+    )
+
+
 def create_app(*, store=None, client=None, queue=None, start_worker=True,
                config=None) -> Flask:
     """
@@ -132,7 +150,11 @@ def create_app(*, store=None, client=None, queue=None, start_worker=True,
         queue = ImportQueue(store, client, delay=instellingen["delay"])
 
     app = Flask(__name__)
-    app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024   # een lijst URL's is klein
+    app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
+    # Werkzeug kapt formuliervelden standaard op 500 KB af, en de bookmarklet
+    # stuurt een hele receptpagina mee. Zonder dit krijg je een 413 zonder
+    # uitleg zodra een pagina iets groter is dan gemiddeld.
+    app.config["MAX_FORM_MEMORY_SIZE"] = 16 * 1024 * 1024
     app.store, app.client, app.queue = store, client, queue
     app.bridge_config = instellingen
 
@@ -180,6 +202,44 @@ def create_app(*, store=None, client=None, queue=None, start_worker=True,
     @app.get("/")
     def index():
         return render_template("index.html")
+
+    @app.post("/bookmarklet")
+    def bookmarklet():
+        """
+        HTML uit je eigen browser, via een formulier-submit.
+
+        Een formulier en geen fetch, en dat is geen smaakkwestie: vanaf een
+        https-pagina mag een fetch naar http://<nas> niet van de browser
+        (mixed content), terwijl een formulier-submit navigatie is en wel mag.
+        Zo doet Tandoors eigen bookmarklet het ook.
+        """
+        url = (request.form.get("url") or "").strip()
+        html = request.form.get("html") or ""
+        log.info("bookmarklet: %s (%d KB HTML)", url, len(html) // 1024)
+
+        try:
+            uitkomst = queue.process_html(url, html, source="bookmarklet")
+        except Exception:
+            log.exception("bookmarklet mislukte voor %s", url)
+            return _bookmarklet_pagina(
+                "Onverwachte fout", "Zie de logboekregels van de brug.", None), 500
+
+        status = uitkomst.get("status")
+        recipe_id = uitkomst.get("recipe_id")
+        link = client.recipe_url(recipe_id) if recipe_id else None
+
+        if status == "klaar":
+            kop, tekst = "Toegevoegd", uitkomst.get("titel") or url
+            if uitkomst.get("note"):
+                tekst += f" — {uitkomst['note']}"
+        elif status == "bestaat_al":
+            kop = "Stond er al"
+            tekst = uitkomst.get("titel") or uitkomst.get("error") or url
+        else:
+            kop = "Niet gelukt"
+            tekst = uitkomst.get("error") or "onbekende reden"
+
+        return _bookmarklet_pagina(kop, tekst, link), 200
 
     @app.get("/healthz")
     def healthz():

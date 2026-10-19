@@ -318,8 +318,70 @@ werkt dan gewoon door met de overige pogingen en zegt bij de start:
 > haalt elke URL op die je hem geeft, dus binnen het Docker-netwerk is de
 > enige plek waar hij hoort.
 
-In `/api/status` zie je onder `browser` of hij is ingesteld, en
-`/api/diagnose` neemt hem mee als vierde poging.
+In `/api/status` zie je onder `browser` of hij is ingesteld en onder
+`browser_bereikbaar` of hij ook antwoordt - dat zijn twee verschillende dingen.
+Antwoordt hij niet, dan zegt `browser_diagnose` welke van de drie oorzaken het
+is: de naam lost niet op (de tweede service staat niet in dezelfde YAML), de
+poort is dicht (de container valt om - kijk in z'n logboek), of `/healthz` is
+stil (hij start nog op). `/api/diagnose` neemt hem mee als vierde poging.
+
+### Zo min mogelijk herkenbaar
+
+Een botdetectie kijkt niet alleen naar headers. Gemeten met `/fingerprint` op
+de renderer zelf:
+
+| signaal | standaard Playwright | hier |
+|---|---|---|
+| `navigator.userAgent` | bevat `HeadlessChrome` | gewone Chrome-UA |
+| `navigator.webdriver` | `true` | `undefined` |
+| browser-binary | de kalere "headless shell" | volledig Chromium |
+| `navigator.languages` | `en-US` | `nl-NL` |
+
+Daarvoor zorgen `--disable-blink-features=AutomationControlled`,
+`ignore_default_args=["--enable-automation"]`, een eigen `USER_AGENT` en
+`BROWSER_CHANNEL=chromium`. Die laatste is nodig omdat Playwright standaard
+een aparte, kalere build gebruikt die makkelijker te herkennen is; bij een
+onbekende channel valt de renderer zelf terug op de standaard, zodat een
+verkeerde waarde de container niet sloopt.
+
+Wat blijft staan: de WebGL-renderer meldt SwiftShader, want er zit geen GPU in
+een container. Dat is een echt signaal en daar is binnen een container weinig
+aan te doen.
+
+**En dan nog kan het niet genoeg zijn.** Bij Albert Heijn is het dat ook niet:
+alle vier de pogingen krijgen een 403, inclusief deze geharde browser. Akamai
+weegt tientallen signalen, waaronder het ontbreken van een echt beeldscherm en
+van de sensor-cookies die hun script zet. Voor zulke sites is de bookmarklet
+hieronder de route die wél werkt.
+
+## De bookmarklet
+
+Voor sites die geen enkele aanvraag van de NAS toelaten. Jouw browser komt er
+wél door - die heeft de cookies en voert hun JavaScript uit - dus laat je die
+de pagina opsturen.
+
+Open de brug in je browser; onder "Voor sites die de brug weigeren" staat een
+knop. **Sleep die naar je bladwijzerbalk** (klikken op de pagina zelf doet
+niets zinnigs). Sta je daarna op een receptpagina, klik de bladwijzer aan: er
+opent een tabblad dat zegt of het gelukt is, met een link naar het recept in
+Tandoor.
+
+Alles ná het ophalen is identiek aan een gewone import, dus de
+dubbelcontrole, de bron-URL, de foto, je automations en de geschiedenis van de
+brug werken precies zo. In de geschiedenis staat `bookmarklet` als bron.
+
+Twee dingen die eraan vastzitten:
+
+- Het is een **formulier-submit en geen `fetch`**, en dat is geen
+  smaakkwestie: vanaf een https-pagina blokkeert je browser een `fetch` naar
+  `http://<nas>` als mixed content, terwijl navigatie via een formulier wel
+  mag. Zo doet Tandoors eigen bookmarklet het ook.
+- De bookmarklet wijst naar de host waarmee je hem opende, dus maak hem aan
+  via het adres dat je ook onderweg gebruikt - via Tailscale werkt hij dan ook
+  buiten huis.
+
+Eén klik per recept, dus geen lijst van 233. Voor die lijst geldt: alles wat
+geen AH is loopt gewoon automatisch door de wachtrij.
 
 ## De rooktest
 

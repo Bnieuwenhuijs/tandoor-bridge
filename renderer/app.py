@@ -39,6 +39,30 @@ NAV_TIMEOUT_MS = int(os.environ.get("NAV_TIMEOUT_MS", "30000"))
 SETTLE_MS = int(os.environ.get("SETTLE_MS", "1500"))
 CHROMIUM_PATH = os.environ.get("CHROMIUM_PATH") or None
 
+# Playwright gebruikt standaard de "headless shell": een aparte, kalere build
+# die makkelijker te herkennen is dan de echte browser. Met channel="chromium"
+# krijg je het volledige binary in de nieuwe headless-modus. Leeg laten om de
+# standaard te gebruiken; bij een onbekende channel vallen we daar zelf op
+# terug, zodat een verkeerde waarde de container niet sloopt.
+BROWSER_CHANNEL = os.environ.get("BROWSER_CHANNEL", "chromium").strip()
+
+# De UA die Playwright meestuurt bevat "HeadlessChrome", en dat is het eerste
+# waar een botdetectie naar kijkt. Hier gemeten: met deze UA en de
+# automation-vlag uit staat navigator.webdriver ook op false.
+USER_AGENT = os.environ.get("USER_AGENT", "").strip() or (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
+)
+
+# --disable-gpu dwingt softwarematige WebGL af, en dat is óók een signaal.
+# Zonder die vlag doet Chromium het in een container alsnog softwarematig,
+# maar we geven het niet gratis weg.
+LAUNCH_ARGS = [
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-blink-features=AutomationControlled",
+]
+
 # Een cookiemelding staat tussen ons en het recept. Een knop zoeken op tekst
 # werkt op meer sites dan een selector per site bijhouden.
 CONSENT_TEKSTEN = (
@@ -94,12 +118,7 @@ class Renderer:
 
                 try:
                     if browser is None:
-                        log.info("browser starten")
-                        browser = pw.chromium.launch(
-                            executable_path=CHROMIUM_PATH,
-                            args=["--no-sandbox", "--disable-dev-shm-usage",
-                                  "--disable-gpu"],
-                        )
+                        browser = self._start(pw)
                     antwoord.put(self._haal_op(browser, url, timeout_ms))
                 except Exception as e:
                     log.exception("ophalen mislukte voor %s", url)
@@ -112,14 +131,38 @@ class Renderer:
                     browser = None
                     antwoord.put({"error": f"{e.__class__.__name__}: {e}"})
 
+    def _start(self, pw):
+        """Start de browser, zo min mogelijk herkenbaar als automatisering."""
+        opties = dict(
+            executable_path=CHROMIUM_PATH,
+            args=LAUNCH_ARGS,
+            # Zonder dit zet Playwright --enable-automation, waarmee
+            # navigator.webdriver op true komt te staan.
+            ignore_default_args=["--enable-automation"],
+        )
+        if BROWSER_CHANNEL:
+            try:
+                log.info("browser starten (channel=%s)", BROWSER_CHANNEL)
+                return pw.chromium.launch(channel=BROWSER_CHANNEL, **opties)
+            except Exception as e:
+                log.warning("channel=%s lukte niet (%s); terug naar de standaard",
+                            BROWSER_CHANNEL, e.__class__.__name__)
+        log.info("browser starten (standaard)")
+        return pw.chromium.launch(**opties)
+
     def _haal_op(self, browser, url: str, timeout_ms: int) -> dict:
         context = browser.new_context(
             locale="nl-NL",
             timezone_id="Europe/Amsterdam",
             viewport={"width": 1280, "height": 900},
+            user_agent=USER_AGENT,
             extra_http_headers={"Accept-Language": "nl-NL,nl;q=0.9,en;q=0.8"},
         )
         try:
+            # Gordel én bretels: de vlag hierboven zet navigator.webdriver al
+            # op false, maar niet elke Chromium-versie doet dat even netjes.
+            context.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
             page = context.new_page()
             antwoord = page.goto(url, wait_until="domcontentloaded",
                                  timeout=timeout_ms)
@@ -135,11 +178,21 @@ class Renderer:
             except Exception:
                 pass  # niet elke site heeft het; de brug beoordeelt dat zelf
 
+            signalen = {}
+            try:
+                signalen = page.evaluate(
+                    "() => ({ua: navigator.userAgent, webdriver: navigator.webdriver,"
+                    " plugins: navigator.plugins.length,"
+                    " languages: navigator.languages.join(',')})")
+            except Exception:
+                pass
+
             return {
                 "html": page.content(),
                 "final_url": page.url,
                 "status": status,
                 "titel": page.title(),
+                "signalen": signalen,
             }
         finally:
             context.close()
@@ -170,6 +223,20 @@ def create_app() -> Flask:
     @app.get("/healthz")
     def healthz():
         return jsonify({"ok": renderer.alive}), (200 if renderer.alive else 503)
+
+    @app.get("/fingerprint")
+    def fingerprint():
+        """
+        Wat verraadt deze browser over zichzelf?
+
+        Handig om te zien of de hardening aankomt zonder een site lastig te
+        vallen: dit haalt about:blank op en leest de signalen waar een
+        botdetectie als eerste naar kijkt.
+        """
+        uitkomst = renderer.render("about:blank", 15000)
+        if "error" in uitkomst:
+            return jsonify(uitkomst), 502
+        return jsonify(uitkomst.get("signalen") or {}), 200
 
     @app.post("/render")
     def render():

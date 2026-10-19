@@ -33,7 +33,8 @@ function fakeEl(naam) {
     hidden: false, disabled: false, value: '', files: [],
     style: {}, classList: { add() {}, remove() {} },
     appendChild(kind) { this.children.push(kind); return kind; },
-    addEventListener() {}, setAttribute() {}, removeAttribute() {},
+    addEventListener() {}, removeAttribute() {},
+    setAttribute(naam, waarde) { this[naam] = waarde; },
   };
 }
 
@@ -44,6 +45,10 @@ globalThis.document = {
   createTextNode(tekst) { return { textContent: tekst }; },
 };
 globalThis.FormData = class { append() {} };
+globalThis.location = {
+  origin: 'http://192.168.1.130:8095',
+  href: 'http://192.168.1.130:8095/',
+};
 
 const ingepland = [];
 const echteSetTimeout = setTimeout;
@@ -94,6 +99,10 @@ function wacht() {
   await globalThis.__t.ververs();
   await wacht();
   uitkomst.druk_ingepland = ingepland.slice();
+
+  // 5. De bookmarklet moet naar deze host wijzen en een formulier posten.
+  uitkomst.bookmarklet = elementen['bookmarklet']
+    ? (elementen['bookmarklet'].href || '') : '';
 
   console.log(JSON.stringify(uitkomst));
 })();
@@ -148,3 +157,23 @@ def test_de_verversing_past_haar_tempo_aan(tmp_path):
     assert uitkomst["rustig_ingepland"] == [15000]   # niets onderweg
     assert uitkomst["druk_ingepland"] == [3000]      # werk in de wachtrij
     assert "2 geïmporteerd" in uitkomst["statusregel"]
+
+
+def test_de_bookmarklet_post_een_formulier_naar_deze_host(tmp_path):
+    """
+    Een formulier en geen fetch, en dat is geen smaakkwestie: vanaf een
+    https-pagina blokkeert de browser een fetch naar http://<nas> als mixed
+    content, terwijl een formulier-submit navigatie is en wel mag. En de
+    actie moet naar de host wijzen waarmee je nu verbonden bent, zodat hij
+    zowel via het LAN als via Tailscale werkt.
+    """
+    uitkomst = draai_pagina(tmp_path)
+    code = uitkomst["bookmarklet"]
+
+    assert code.startswith("javascript:")
+    assert "http://192.168.1.130:8095/bookmarklet" in code
+    assert "f.method='POST'" in code
+    assert "fetch(" not in code
+    # En hij stuurt de pagina mee die de browser zelf ziet.
+    assert "document.documentElement.outerHTML" in code
+    assert "a('url',location.href)" in code

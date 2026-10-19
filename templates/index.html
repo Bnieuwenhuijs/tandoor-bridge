@@ -119,6 +119,11 @@ a { color: var(--accent); }
 }
 .melding.fout { color: var(--rood); }
 input[type=file] { font: inherit; max-width: 100%; }
+.bookmarkletknop {
+  display: inline-block; padding: 10px 16px; border-radius: 8px;
+  background: var(--accent); color: var(--accent-tekst);
+  text-decoration: none; font-weight: 500; cursor: grab;
+}
 .rij { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
 </style>
 </head>
@@ -149,6 +154,19 @@ input[type=file] { font: inherit; max-width: 100%; }
     <button id="importeervoorbeeld" class="primair klein">Importeer deze</button>
   </div>
   <ul id="voorbeeld" style="margin-top:12px"></ul>
+</section>
+
+<section class="kaart">
+  <h2>Voor sites die de brug weigeren</h2>
+  <p class="sub" style="margin-top:0">
+    Albert Heijn weigert elke aanvraag van de NAS, ook die van een echte
+    browser daarop. Jouw browser komt er wél door, want die heeft de cookies
+    en voert hun JavaScript uit. Sleep deze knop naar je bladwijzerbalk; sta je
+    op zo'n receptpagina, klik hem dan aan.
+  </p>
+  <p><a id="bookmarklet" class="bookmarkletknop" href="#">Recept naar Tandoor</a></p>
+  <p class="sub"><strong>Slepen, niet klikken</strong> — hier op deze pagina
+    doet hij niets zinnigs.</p>
 </section>
 
 <section class="kaart">
@@ -415,6 +433,21 @@ $("opnieuwalles").addEventListener("click", async () => {
   await vraag("/api/retry-failed", { method: "POST" });
   ververs();
 });
+// De bookmarklet wijst naar de host waarmee je nu verbonden bent, dus hij
+// werkt zowel via het LAN als via Tailscale zonder iets aan te passen.
+// Een formulier en geen fetch: vanaf een https-pagina mag een fetch naar
+// http://<nas> niet van de browser, een formulier-submit wel.
+(() => {
+  const doel = location.origin + "/bookmarklet";
+  $("bookmarklet").setAttribute("href",
+    "javascript:(function(){var f=document.createElement('form');" +
+    "f.method='POST';f.action='" + doel + "';f.target='_blank';" +
+    "function a(n,v){var i=document.createElement('input');i.type='hidden';" +
+    "i.name=n;i.value=v;f.appendChild(i);}" +
+    "a('url',location.href);a('html',document.documentElement.outerHTML);" +
+    "document.body.appendChild(f);f.submit();f.remove();})()");
+})();
+
 // Op de telefoon is ctrl/cmd+enter sneller dan naar de knop reiken.
 $("invoer").addEventListener("keydown", (e) => {
   if ((e.metaKey || e.ctrlKey) && e.key === "Enter") importeer();

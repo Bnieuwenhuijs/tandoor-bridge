@@ -349,3 +349,71 @@ def test_status_zonder_browser_container(brug, monkeypatch):
     data = http.get("/api/status").get_json()
     assert data["browser"] is None
     assert data["browser_bereikbaar"] is None
+
+
+# ---------------------------------------------------------------- bookmarklet
+
+def test_bookmarklet_voegt_een_recept_toe(brug, tandoor):
+    """
+    De route voor sites die geen enkele server-side aanvraag toelaten: jouw
+    browser levert de HTML aan, en alles daarna is een gewone import.
+    """
+    from conftest import AH_HTML, AH_URL
+
+    http, store, _ = brug
+    antwoord = http.post("/bookmarklet", data={"url": AH_URL, "html": AH_HTML})
+    assert antwoord.status_code == 200
+
+    pagina = antwoord.get_data(as_text=True)
+    assert "Toegevoegd" in pagina
+    assert "Kip korma met spinazie" in pagina
+    assert "/recipe/1" in pagina                 # link naar Tandoor
+
+    # En de geschiedenis van de brug weet ervan, met de bron erbij.
+    item = store.items()[0]
+    assert item["status"] == "klaar"
+    assert item["source"] == "bookmarklet"
+    assert tandoor.state()["recipes"][0]["source_url"] == AH_URL
+
+
+def test_bookmarklet_met_een_grote_pagina(brug):
+    """
+    Werkzeug kapt formuliervelden standaard op 500 KB af. Een receptpagina is
+    groter, en dan krijg je een 413 zonder uitleg.
+    """
+    from conftest import AH_HTML, AH_URL
+
+    http, _, _ = brug
+    groot = AH_HTML.replace("</body>", "<p>" + "x" * 900_000 + "</p></body>")
+    assert len(groot) > 500_000
+
+    antwoord = http.post("/bookmarklet", data={"url": AH_URL, "html": groot})
+    assert antwoord.status_code == 200
+    assert "Toegevoegd" in antwoord.get_data(as_text=True)
+
+
+def test_bookmarklet_tweede_keer_zegt_dat_het_er_al_staat(brug):
+    from conftest import AH_HTML, AH_URL
+
+    http, _, _ = brug
+    http.post("/bookmarklet", data={"url": AH_URL, "html": AH_HTML})
+    antwoord = http.post("/bookmarklet", data={"url": AH_URL, "html": AH_HTML})
+    assert "Stond er al" in antwoord.get_data(as_text=True)
+
+
+def test_bookmarklet_zonder_html(brug):
+    http, _, _ = brug
+    antwoord = http.post("/bookmarklet", data={"url": "https://www.ah.nl/r/1"})
+    pagina = antwoord.get_data(as_text=True)
+    assert "Niet gelukt" in pagina
+    assert "geen HTML" in pagina
+
+
+def test_bookmarklet_met_een_pagina_zonder_recept(brug):
+    http, _, _ = brug
+    antwoord = http.post("/bookmarklet", data={
+        "url": "https://www.ah.nl/allerhande/recept/R-R1",
+        "html": "<html><head><title>Even geduld…</title></head><body>x</body></html>"})
+    pagina = antwoord.get_data(as_text=True)
+    assert "Niet gelukt" in pagina
+    assert "geen recept-schema" in pagina
