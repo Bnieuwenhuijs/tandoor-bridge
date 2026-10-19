@@ -22,7 +22,12 @@ from datetime import datetime, timezone
 from urllib.parse import urljoin
 
 from fetcher import FetchError, fetch_image, fetch_page
-from tandoor import TandoorError, TandoorNoRecipe, TandoorThrottled
+from tandoor import (
+    TandoorError,
+    TandoorNoRecipe,
+    TandoorThrottled,
+    TandoorUnreachable,
+)
 from urls import dedupe_key, extract_urls, normalize_url
 
 log = logging.getLogger(__name__)
@@ -42,6 +47,10 @@ AFGEROND = (KLAAR, BESTAAT_AL)
 
 # Een limiet die zo vaak terugkomt is geen limiet meer maar een probleem.
 MAX_LIMIET_POGINGEN = 50
+
+# Tandoor die niet antwoordt is meestal tijdelijk: een herstart na een update
+# duurt seconden. Maar niet eindeloos blijven proberen.
+MAX_ONBEREIKBAAR = 5
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS items (
@@ -258,7 +267,7 @@ class Store:
         with self._connect() as db:
             cursor = db.execute(
                 "UPDATE items SET status = ?, error = NULL, note = NULL, "
-                "updated_at = ? WHERE id = ? AND status = ?",
+                "attempts = 0, updated_at = ? WHERE id = ? AND status = ?",
                 (WACHTEND, _now(), item_id, MISLUKT))
             return cursor.rowcount > 0
 
@@ -266,7 +275,8 @@ class Store:
         with self._connect() as db:
             cursor = db.execute(
                 "UPDATE items SET status = ?, error = NULL, note = NULL, "
-                "updated_at = ? WHERE status = ?", (WACHTEND, _now(), MISLUKT))
+                "attempts = 0, updated_at = ? WHERE status = ?",
+                (WACHTEND, _now(), MISLUKT))
             return cursor.rowcount
 
     def find_imported(self, key, *, exclude_id=None) -> dict | None:
@@ -344,7 +354,18 @@ class ImportQueue:
         item = self.store.claim_next()
         if not item:
             return None
+        try:
+            return self._process(item)
+        except Exception as e:
+            # Het item staat op dit moment op 'ophalen' of 'naar_tandoor'.
+            # requeue_stale() draait alleen bij de start, dus zonder deze
+            # vangst blijft het daar staan tot de container herstart - en
+            # verdwijnt het uit de rij zonder dat iemand het ziet.
+            self.store.update(item["id"], status=MISLUKT,
+                              error=f"onverwachte fout: {e.__class__.__name__}: {e}")
+            raise
 
+    def _process(self, item: dict) -> dict:
         item_id, url = item["id"], item["url"]
         log.info("[%s] %s", item_id, url)
 
@@ -369,6 +390,8 @@ class ImportQueue:
             bron = self.client.recipe_from_source(url, pagina.html)
         except TandoorThrottled as e:
             return self._handle_throttle(item, e)
+        except TandoorUnreachable as e:
+            return self._handle_unreachable(item, e)
         except TandoorNoRecipe as e:
             self.store.update(item_id, status=MISLUKT,
                               error=f"Tandoor vond geen recept: {e.message}")
@@ -388,6 +411,14 @@ class ImportQueue:
         # 5. Aanmaken.
         try:
             recept = self.client.create_recipe(bron.recipe, source_url=url)
+        except TandoorThrottled as e:
+            return self._handle_throttle(item, e)
+        except TandoorUnreachable as e:
+            # Let op: het recept kán aangemaakt zijn en alleen het antwoord
+            # verloren. Daarom gaat dit item terug in de rij in plaats van op
+            # mislukt - bij de volgende poging ziet Tandoors duplicates-lijst
+            # het recept en wordt het "bestaat al".
+            return self._handle_unreachable(item, e)
         except TandoorError as e:
             self.store.update(item_id, status=MISLUKT, error=e.message)
             return {"status": MISLUKT}
@@ -415,6 +446,18 @@ class ImportQueue:
                                f"({fout.retry_after} s)")
         log.warning("importlimiet bereikt; %s seconden wachten", fout.retry_after)
         return {"status": WACHTEND, "wait": fout.retry_after}
+
+    def _handle_unreachable(self, item, fout: TandoorUnreachable) -> dict:
+        """Tandoor antwoordde niet; terug in de rij, want dat is vaak tijdelijk."""
+        if item["attempts"] >= MAX_ONBEREIKBAAR:
+            self.store.update(item["id"], status=MISLUKT, error=fout.message)
+            return {"status": MISLUKT}
+        self.store.update(
+            item["id"], status=WACHTEND,
+            note=f"Tandoor antwoordde niet; poging {item['attempts']} van "
+                 f"{MAX_ONBEREIKBAAR}")
+        log.warning("Tandoor antwoordde niet voor item %s: %s", item["id"], fout.message)
+        return {"status": WACHTEND, "wait": min(60, 5 * max(1, item["attempts"]))}
 
     def _attach_photo(self, recipe_id, bron, pagina) -> str | None:
         foto_url = bron.recipe.get("image_url") or (bron.images[0] if bron.images else None)

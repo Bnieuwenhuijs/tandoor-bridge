@@ -10,10 +10,19 @@ services:
     env_file: .env
     ports:
       # Alleen op het LAN en via Tailscale, niet naar het internet
-      # doorzetten in je router.
-      - "8095:8095"
+      # doorzetten in je router. PORT komt uit .env en geldt aan beide
+      # kanten: anders verzet je alleen de poort binnen de container en is
+      # de brug daarna onbereikbaar.
+      - "${PORT:-8095}:${PORT:-8095}"
     volumes:
       # De geschiedenis moet een herstart en een update overleven.
+      #
+      # Maak deze map zelf aan en geef hem aan de gebruiker uit het image,
+      # vóór de eerste start:
+      #     mkdir -p data && sudo chown -R 10001:10001 data
+      # Laat je dat aan Docker over, dan maakt die hem aan als root en kan de
+      # container er niet in schrijven. De brug zegt dan bij de start wel
+      # precies wat eraan te doen is, maar dit scheelt die ronde.
       - ./data:/data
     logging:
       # Zonder grens groeien de logs van een container die maanden draait

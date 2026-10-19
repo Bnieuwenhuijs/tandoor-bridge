@@ -21,6 +21,45 @@ from urls import extract_urls
 log = logging.getLogger("tandoor_bridge")
 
 
+def configureer_logging() -> None:
+    """
+    Zet het logboek op stdout, waar het ook vandaan gestart wordt.
+
+    Dit stond eerst alleen in main(), en gunicorn roept main() nooit aan - dat
+    start create_app() rechtstreeks. Gevolg: in de container bleef de
+    root-logger op WARNING staan en stond er geen enkele importregel in de
+    Docker-logs, terwijl dat juist de plek is waar je kijkt wat de brug doet.
+    """
+    niveau = os.environ.get("LOG_LEVEL", "INFO").strip().upper() or "INFO"
+    wortel = logging.getLogger()
+    if wortel.handlers:
+        wortel.setLevel(niveau)
+        return
+    logging.basicConfig(
+        level=niveau,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        stream=sys.stdout,   # zodat het in de Docker-logs van de NAS staat
+    )
+
+
+def _env_getal(naam: str, default, soort=float):
+    """
+    Een getal uit de omgeving, met de standaard als het geen getal is.
+
+    Een typefout in IMPORT_DELAY_SECONDS liet de container anders in een
+    herstartlus lopen met een kale ValueError, en dat is een vervelende fout
+    om op een NAS terug te vinden.
+    """
+    ruw = os.environ.get(naam, "").strip()
+    if not ruw:
+        return default
+    try:
+        return soort(ruw)
+    except ValueError:
+        log.warning("%s is geen getal (%r); %s wordt gebruikt", naam, ruw, default)
+        return default
+
+
 def _env_bool(naam: str, default: bool = False) -> bool:
     waarde = os.environ.get(naam)
     if waarde is None:
@@ -34,8 +73,8 @@ def config_from_env() -> dict:
         "tandoor_token": os.environ.get("TANDOOR_TOKEN", "").strip(),
         "public_url": os.environ.get("TANDOOR_PUBLIC_URL", "").strip() or None,
         "data_dir": os.environ.get("DATA_DIR", "/data"),
-        "delay": float(os.environ.get("IMPORT_DELAY_SECONDS", "5")),
-        "port": int(os.environ.get("PORT", "8095")),
+        "delay": max(0.0, _env_getal("IMPORT_DELAY_SECONDS", 5.0, float)),
+        "port": _env_getal("PORT", 8095, int),
         "send_properties": _env_bool("SEND_PROPERTIES", False),
     }
 
@@ -78,6 +117,7 @@ def create_app(*, store=None, client=None, queue=None, start_worker=True,
     tegen een eigen database en een nagebouwde Tandoor kunnen zetten zonder
     omgevingsvariabelen.
     """
+    configureer_logging()
     instellingen = config or config_from_env()
 
     if client is None:
@@ -116,7 +156,11 @@ def create_app(*, store=None, client=None, queue=None, start_worker=True,
         stuurt liever {"url": ...}, en Home Assistant stuurt soms gewoon een
         formulierveld.
         """
-        body = request.get_json(silent=True) or {}
+        # get_json geeft ook een lijst of een losse string terug als de body
+        # dat was; .get() daarop is een AttributeError en dus een 500.
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict):
+            body = {}
         stukken = []
         for sleutel in ("text", "url", "urls"):
             waarde = body.get(sleutel)
@@ -181,7 +225,11 @@ def create_app(*, store=None, client=None, queue=None, start_worker=True,
     @app.get("/api/items")
     def items():
         status = request.args.get("status") or None
-        limiet = min(int(request.args.get("limit", 100)), 1000)
+        try:
+            limiet = int(request.args.get("limit", 100))
+        except (TypeError, ValueError):
+            limiet = 100
+        limiet = max(1, min(limiet, 1000))   # een negatieve limiet haalde de grens eruit
         return jsonify({
             "items": [verrijk(i) for i in store.items(status=status, limit=limiet)],
             "counts": store.counts(),
@@ -227,11 +275,7 @@ def create_app(*, store=None, client=None, queue=None, start_worker=True,
 
 
 def main():
-    logging.basicConfig(
-        level=os.environ.get("LOG_LEVEL", "INFO").upper(),
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-        stream=sys.stdout,   # zodat het in de Docker-logs van UGOS staat
-    )
+    configureer_logging()
     instellingen = config_from_env()
     ontbreekt = [naam for naam, sleutel in
                  (("TANDOOR_URL", "tandoor_url"), ("TANDOOR_TOKEN", "tandoor_token"))

@@ -254,3 +254,41 @@ def test_een_onschrijfbare_datamap_zegt_wat_eraan_te_doen(tmp_path, client):
     assert "kan niet schrijven" in melding
     assert "uid" in melding
     assert "chown" in melding
+
+
+def test_logboek_staat_aan_zonder_main(brug):
+    """
+    Gunicorn roept main() nooit aan. Zonder configuratie in create_app bleef
+    de root-logger op WARNING en stond er niets in de Docker-logs.
+    """
+    import logging
+    assert logging.getLogger().handlers
+    assert logging.getLogger().level <= logging.INFO
+
+
+def test_json_body_die_geen_object_is(brug):
+    """Een lijst of losse string als body gaf een AttributeError, dus een 500."""
+    http, _, _ = brug
+    for body in ([1, 2, 3], "zomaar tekst", 42):
+        antwoord = http.post("/api/import", json=body)
+        assert antwoord.status_code == 400
+        assert "error" in antwoord.get_json()
+
+
+def test_onzinnige_limiet(brug):
+    http, store, _ = brug
+    store.add([AH_URL])
+    assert http.get("/api/items?limit=abc").status_code == 200
+    assert http.get("/api/items?limit=-5").status_code == 200
+    # En een te hoge limiet wordt nog steeds afgetopt.
+    assert len(http.get("/api/items?limit=99999").get_json()["items"]) == 1
+
+
+def test_onzinnige_instellingen_vallen_terug_op_de_standaard(monkeypatch):
+    """Een typefout in .env mag geen herstartlus opleveren."""
+    import app as appmodule
+    monkeypatch.setenv("IMPORT_DELAY_SECONDS", "vijf")
+    monkeypatch.setenv("PORT", "")
+    instellingen = appmodule.config_from_env()
+    assert instellingen["delay"] == 5.0
+    assert instellingen["port"] == 8095

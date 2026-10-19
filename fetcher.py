@@ -241,12 +241,18 @@ def fetch_image(url: str, *, referer: str | None = None, timeout: int = 20) -> t
             raise FetchError(f"dit is geen afbeelding maar {content_type or 'onbekend'}")
 
         inhoud = bytearray()
-        for brok in resp.iter_content(64 * 1024):
-            inhoud += brok
-            if len(inhoud) > MAX_IMAGE_BYTES:
-                raise FetchError(
-                    f"foto is groter dan {MAX_IMAGE_BYTES // (1024 * 1024)} MB"
-                )
+        try:
+            for brok in resp.iter_content(64 * 1024):
+                inhoud += brok
+                if len(inhoud) > MAX_IMAGE_BYTES:
+                    raise FetchError(
+                        f"foto is groter dan {MAX_IMAGE_BYTES // (1024 * 1024)} MB"
+                    )
+        except requests.RequestException as e:
+            # Het eerste verzoek lukte, maar de verbinding viel tijdens het
+            # binnenhalen weg. Zonder deze vangst ontsnapt een ruwe
+            # requests-fout aan FetchError, en dan vangt de wachtrij hem niet.
+            raise FetchError(f"foto half binnengekomen ({e.__class__.__name__})") from e
 
     if not inhoud:
         raise FetchError("foto was leeg")
