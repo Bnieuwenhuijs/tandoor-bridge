@@ -1,0 +1,14 @@
+# De .env bevat het Tandoor-token en hoort nooit in git.
+.env
+*.env
+!example.env
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# De SQLite-database en gedownloade afbeeldingen leven in een volume.
+data/
+*.sqlite3
