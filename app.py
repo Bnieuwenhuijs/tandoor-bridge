@@ -247,11 +247,16 @@ def create_app(*, store=None, client=None, queue=None, start_worker=True,
 
     @app.get("/api/status")
     def status():
+        from fetcher import RENDERER_URL
+
         return jsonify({
             "counts": store.counts(),
             "worker": queue.running,
             "delay": queue.delay,
             "tandoor": client.public_url,
+            # Zodat je kunt zien of de browser-container is ingesteld: zonder
+            # die staat Albert Heijn je sowieso niet toe.
+            "browser": RENDERER_URL or None,
         }), 200
 
     @app.get("/api/diagnose")
@@ -330,6 +335,13 @@ def main():
     except TandoorError as e:
         log.warning("Tandoor antwoordt nog niet: %s", e.message)
 
+    from fetcher import RENDERER_URL
+
+    if RENDERER_URL:
+        log.info("browser-container ingesteld op %s", RENDERER_URL)
+    else:
+        log.info("geen browser-container (RENDERER_URL is leeg); sites die elke "
+                 "server-side aanvraag weigeren, zoals Albert Heijn, lukken niet")
     log.info("brug draait op poort %s, pauze van %ss tussen imports",
              instellingen["port"], instellingen["delay"])
     app.run(host="0.0.0.0", port=instellingen["port"])

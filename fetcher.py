@@ -26,6 +26,7 @@ staat op een lijst".
 """
 
 import logging
+import os
 import re
 from dataclasses import dataclass
 
@@ -239,54 +240,105 @@ def _attempt_curl(url: str, *, timeout: int) -> _Attempt | None:
     return _judge(url, resp.status_code, resp.text, str(resp.url), via="curl_cffi")
 
 
-def fetch_page(url: str, *, timeout: int = 20, impersonate: bool = True) -> FetchResult:
+# De browser-container, als die er is. Zie renderer/ en de README.
+RENDERER_URL = os.environ.get("RENDERER_URL", "").strip().rstrip("/")
+
+
+def _attempt_renderer(url: str, *, timeout: int, renderer: str) -> _Attempt:
+    """
+    Laat de browser-container de pagina ophalen.
+
+    Nodig voor sites die elke server-side aanvraag weigeren: Albert Heijn geeft
+    403 op requests én op curl_cffi met TLS-vingerafdruk, omdat Akamai z'n
+    sensor-cookies pas zet nadat het JavaScript op de pagina gedraaid heeft.
+    Een echte browser doet dat gewoon.
+    """
+    try:
+        resp = requests.post(f"{renderer}/render", json={"url": url},
+                             timeout=(5, timeout + 60))
+    except requests.RequestException as e:
+        return _Attempt(False, f"browser-container niet te bereiken "
+                               f"({e.__class__.__name__})")
+    try:
+        body = resp.json()
+    except ValueError:
+        return _Attempt(False, f"browser-container gaf status {resp.status_code}")
+    if resp.status_code != 200 or "html" not in body:
+        return _Attempt(False, f"browser: {body.get('error') or resp.status_code}")
+    return _judge(url, body.get("status") or 200, body["html"],
+                  body.get("final_url") or url, via="browser")
+
+
+def fetch_page(url: str, *, timeout: int = 20, impersonate: bool = True,
+               renderer_url: str | None = None) -> FetchResult:
     """
     Haal een receptpagina op. Gooit FetchError met een leesbare reden.
 
     De HTML gaat hierna onbewerkt naar Tandoor: wij ontleden niets.
     """
-    eerste = _attempt_requests(url, timeout=timeout,
-                               headers=HEADERS_MINIMAAL, naam="requests")
-    if eerste.ok:
-        log.info("opgehaald: %s (status %s)", url, eerste.status)
-        return eerste.result
-    log.warning("poging 1 (minimale headers) mislukt voor %s: %s", url, eerste.reason)
+    renderer = RENDERER_URL if renderer_url is None else (renderer_url or "").rstrip("/")
+    redenen = []
 
-    tweede = _attempt_requests(url, timeout=timeout,
-                               headers=HEADERS, naam="requests+headers")
-    if tweede.ok:
-        log.info("poging 2 (volledige headers) gelukt: %s", url)
-        return tweede.result
-    log.warning("poging 2 (volledige headers) mislukt voor %s: %s", url, tweede.reason)
+    pogingen = [
+        ("minimale headers",
+         lambda: _attempt_requests(url, timeout=timeout,
+                                   headers=HEADERS_MINIMAAL, naam="requests")),
+        ("volledige headers",
+         lambda: _attempt_requests(url, timeout=timeout,
+                                   headers=HEADERS, naam="requests+headers")),
+    ]
+    if impersonate:
+        pogingen.append(("curl_cffi", lambda: _attempt_curl(url, timeout=timeout)))
 
-    if not impersonate:
-        raise FetchError(f"{eerste.reason}; met volledige headers: {tweede.reason}",
-                         status=eerste.status)
+    gelukt = None
+    eerste_status = None
+    for naam, doe in pogingen:
+        uitkomst = doe()
+        if uitkomst is None:
+            redenen.append(f"{naam}: niet beschikbaar")
+            continue
+        if uitkomst.ok:
+            log.info("opgehaald via %s: %s (status %s)", naam, url, uitkomst.status)
+            gelukt = uitkomst.result
+            break
+        redenen.append(f"{naam}: {uitkomst.reason}")
+        eerste_status = eerste_status or uitkomst.status
+        log.warning("poging mislukt (%s) voor %s: %s", naam, url, uitkomst.reason)
+        if uitkomst.status in (404, 410):
+            # De pagina is er niet. Andere headers veranderen daar niets aan,
+            # en een browserronde al helemaal niet.
+            raise FetchError(uitkomst.reason, status=uitkomst.status)
 
-    derde = _attempt_curl(url, timeout=timeout)
-    if derde is None:
-        raise FetchError(
-            f"{eerste.reason}; curl_cffi is niet beschikbaar voor een derde poging",
-            status=eerste.status,
-        )
-    if derde.ok:
-        log.info("poging 3 met curl_cffi gelukt: %s", url)
-        return derde.result
+    # De browser is de laatste redding: of niets kwam door, of wat doorkwam
+    # bevat geen recept-schema (een cookiemuur geeft ook een nette 200).
+    # Zonder browser-container hebben extra pogingen geen zin: dezelfde server
+    # stuurt dezelfde inhoud, en alleen een echte browser verandert dat.
+    if renderer and (gelukt is None or not describe_page(gelukt.html)["heeft_schema"]):
+        if gelukt is not None:
+            log.info("pagina zonder recept-schema, nu via de browser: %s", url)
+        via_browser = _attempt_renderer(url, timeout=timeout, renderer=renderer)
+        if via_browser.ok and describe_page(via_browser.result.html)["heeft_schema"]:
+            log.info("via de browser gelukt: %s", url)
+            return via_browser.result
+        if via_browser.ok and gelukt is None:
+            return via_browser.result          # beter dan niets
+        if not via_browser.ok:
+            redenen.append(f"browser: {via_browser.reason}")
 
-    raise FetchError(
-        f"{eerste.reason}; ook met curl_cffi: {derde.reason}",
-        status=derde.status or eerste.status,
-    )
+    if gelukt is not None:
+        return gelukt
+    raise FetchError("; ".join(redenen) or "geen enkele poging kwam door",
+                     status=eerste_status)
 
 
 def probe(url: str, *, timeout: int = 20) -> list:
     """
     Probeer alle manieren náást elkaar en zeg per poging wat eruit kwam.
 
-    Alleen voor het stellen van een diagnose: dit haalt dezelfde pagina tot
-    drie keer op, dus niet gebruiken in de wachtrij.
+    Alleen voor het stellen van een diagnose: dit haalt dezelfde pagina
+    meerdere keren op, dus niet gebruiken in de wachtrij.
     """
-    varianten = (
+    varianten = [
         ("requests, minimale headers",
          lambda: _attempt_requests(url, timeout=timeout,
                                    headers=HEADERS_MINIMAAL, naam="requests")),
@@ -295,10 +347,20 @@ def probe(url: str, *, timeout: int = 20) -> list:
                                    headers=HEADERS, naam="requests+headers")),
         (f"curl_cffi, impersonate={IMPERSONATE}",
          lambda: _attempt_curl(url, timeout=timeout)),
-    )
+    ]
+    if RENDERER_URL:
+        varianten.append(
+            ("browser-container",
+             lambda: _attempt_renderer(url, timeout=timeout, renderer=RENDERER_URL)))
+    else:
+        varianten.append(("browser-container", None))
 
     uitkomsten = []
     for naam, poging in varianten:
+        if poging is None:
+            uitkomsten.append({"poging": naam, "ok": False,
+                               "reden": "niet ingesteld (RENDERER_URL is leeg)"})
+            continue
         uitkomst = poging()
         if uitkomst is None:
             uitkomsten.append({"poging": naam, "ok": False,

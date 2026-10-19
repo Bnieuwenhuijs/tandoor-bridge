@@ -6,6 +6,7 @@ staat hieronder letterlijk in AKAMAI_BLOKKADE, overgenomen van een echte
 geweigerde aanvraag.
 """
 
+import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -36,9 +37,38 @@ RECEPTPAGINA = (
 
 JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 512
 
+# Wat een echte browser zou teruggeven: dezelfde pagina, maar mét het schema
+# dat Akamai pas na het uitvoeren van JavaScript laat zien.
+MET_SCHEMA = (
+    '<html><head><title>Kip korma</title>'
+    '<script type="application/ld+json">'
+    '{"@context":"https://schema.org","@type":"Recipe","name":"Kip korma"}'
+    '</script></head><body>recept</body></html>'
+)
+
 
 class _Handler(BaseHTTPRequestHandler):
     ontvangen: list = []
+    # Wat de nagebootste browser-container antwoordt; tests zetten dit.
+    render_html: str | None = MET_SCHEMA
+    render_fout: str | None = None
+
+    def do_POST(self):
+        lengte = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(lengte)
+        _Handler.ontvangen.append((self.path, dict(self.headers)))
+        if self.path != "/render":
+            self._stuur(404, "application/json", b'{"error":"onbekend"}')
+            return
+        if _Handler.render_fout:
+            self._stuur(502, "application/json",
+                        json.dumps({"error": _Handler.render_fout}).encode())
+            return
+        gevraagd = json.loads(body or b"{}").get("url", "")
+        self._stuur(200, "application/json", json.dumps({
+            "html": _Handler.render_html, "final_url": gevraagd,
+            "status": 200, "titel": "Kip korma",
+        }).encode())
 
     def do_GET(self):
         _Handler.ontvangen.append((self.path, dict(self.headers)))
@@ -88,6 +118,8 @@ def site():
     server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     _Handler.ontvangen = []
+    _Handler.render_html = MET_SCHEMA
+    _Handler.render_fout = None
     try:
         yield f"http://127.0.0.1:{server.server_address[1]}"
     finally:
@@ -203,7 +235,11 @@ def test_beide_pogingen_geblokkeerd(site, monkeypatch):
     )
     with pytest.raises(FetchError) as fout:
         fetch_page(f"{site}/geweigerd")
-    assert "ook met curl_cffi" in fout.value.reason
+    # Elke poging staat met z'n eigen reden in de melding, zodat je ziet
+    # welke manieren geprobeerd zijn.
+    assert "minimale headers" in fout.value.reason
+    assert "volledige headers" in fout.value.reason
+    assert "curl_cffi" in fout.value.reason
 
 
 def test_foto_komt_binnen_met_referer(site):
@@ -248,3 +284,64 @@ def test_fotoheaders_zonder_referer():
     headers = image_headers()
     assert "Referer" not in headers
     assert headers["Accept"].startswith("image/")
+
+
+# ------------------------------------------------- de browser-container
+
+def test_browser_is_de_laatste_redding(site):
+    """
+    Albert Heijn weigert elke server-side aanvraag met 403, ook curl_cffi met
+    TLS-vingerafdruk: Akamai zet z'n sensor-cookies pas nadat het JavaScript
+    op de pagina gedraaid heeft. Dan is een echte browser wat er nog overblijft.
+    """
+    result = fetch_page(f"{site}/geweigerd", renderer_url=site)
+    assert result.via == "browser"
+    assert "Kip korma" in result.html
+
+
+def test_browser_wordt_ook_gebruikt_bij_een_pagina_zonder_schema(site):
+    """
+    Een cookiemuur komt met een nette 200 terug, dus "het kwam door" is niet
+    genoeg: er moet een recept in staan.
+    """
+    assert "application/ld+json" not in RECEPTPAGINA.decode()
+
+    result = fetch_page(f"{site}/ok", renderer_url=site)
+    assert result.via == "browser"
+    assert "application/ld+json" in result.html
+
+
+def test_zonder_browser_container_geen_extra_poging(site):
+    """
+    Zonder browser hebben extra pogingen geen zin: dezelfde server stuurt
+    dezelfde inhoud. Dan houden we wat we hebben.
+    """
+    result = fetch_page(f"{site}/ok", renderer_url="")
+    assert result.via == "requests"
+    assert "application/ld+json" not in result.html
+
+
+def test_een_kapotte_browser_container_laat_de_reden_zien(site):
+    import test_fetcher
+
+    test_fetcher._Handler.render_fout = "Page.goto: net::ERR_TIMED_OUT"
+    with pytest.raises(FetchError) as fout:
+        fetch_page(f"{site}/geweigerd", renderer_url=site)
+    assert "browser" in fout.value.reason
+    assert "ERR_TIMED_OUT" in fout.value.reason
+
+
+def test_browser_container_onbereikbaar(site):
+    """De brug mag niet omvallen als de tweede container uit staat."""
+    with pytest.raises(FetchError) as fout:
+        fetch_page(f"{site}/geweigerd", renderer_url="http://127.0.0.1:1")
+    assert "niet te bereiken" in fout.value.reason
+
+
+def test_verdwenen_pagina_kost_geen_browserronde(site):
+    """Een 404 is definitief; daar helpt geen enkele andere poging aan."""
+    _Handler.ontvangen = []
+    with pytest.raises(FetchError) as fout:
+        fetch_page(f"{site}/verdwenen", renderer_url=site)
+    assert fout.value.status == 404
+    assert not [p for p, _ in _Handler.ontvangen if p == "/render"]

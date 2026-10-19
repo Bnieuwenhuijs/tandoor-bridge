@@ -58,6 +58,9 @@ services:
       IMPORT_DELAY_SECONDS: "5"
       DATA_DIR: "/data"
       SEND_PROPERTIES: "false"
+      # Verwijst naar de tweede container hieronder. Leeg laten = geen browser,
+      # en dan lukt Albert Heijn niet.
+      RENDERER_URL: "http://tandoor-bridge-renderer:8096"
       LOG_LEVEL: "INFO"
 
     ports:
@@ -86,6 +89,32 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  # Alleen nodig voor sites die elke server-side aanvraag weigeren, zoals
+  # Albert Heijn: Akamai zet z'n sensor-cookies pas nadat het JavaScript op de
+  # pagina gedraaid heeft, en dan is een echte browser wat er nog overblijft.
+  #
+  # De brug gebruikt hem alleen als de gewone pogingen falen of een pagina
+  # zonder recept opleveren. Haal deze service en RENDERER_URL weg als je geen
+  # AH importeert; dan blijft alleen de lichte container over.
+  #
+  # De browser start pas bij het eerste verzoek en sluit zichzelf weer af na
+  # BROWSER_IDLE_SECONDS zonder werk, dus tussen twee importrondes kost dit
+  # geen geheugen.
+  tandoor-bridge-renderer:
+    image: ghcr.io/bnieuwenhuijs/tandoor-bridge-renderer:claude-practical-johnson-jsrrgm
+    pull_policy: always
+    restart: unless-stopped
+    environment:
+      BROWSER_IDLE_SECONDS: "120"
+      NAV_TIMEOUT_MS: "30000"
+      LOG_LEVEL: "INFO"
+    # Geen ports: alleen de brug praat ermee, binnen het Docker-netwerk. Zet
+    # hem niet open - hij haalt elke URL op die je hem geeft.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 # ---------------------------------------------------------------------------
 # VARIANT B: met een named volume, zonder iets vooraf aan te maken

@@ -242,14 +242,26 @@ werkelijke limiet ongeveer 60 × het aantal workers.
 
 ## Als een site toch blokkeert
 
-De brug doet twee pogingen: eerst `requests` met browserheaders, daarna
-`curl_cffi` met `impersonate="chrome"` voor sites die naar de
-TLS-vingerafdruk van de client kijken. In het logboek staat welke poging het
-was en wat er terugkwam:
+De brug probeert het in deze volgorde, en stopt bij de eerste die lukt:
+
+1. **`requests` met minimale headers** - alleen een User-Agent en
+   `Accept-Language`. Dit is de set uit `recipe_parser`, die zich bewezen
+   heeft, en hij staat vooraan om een reden: de uitgebreidere set hieronder
+   bleek bij AH juist een 403 op te leveren. Akamai beoordeelt de combinatie,
+   en Chrome-headers zonder bijpassende TLS-vingerafdruk zijn verdachter dan
+   een kale User-Agent.
+2. **`requests` met de volledige set** - `Sec-Fetch-*`, `Sec-Ch-Ua` en de
+   rest, voor sites die juist die headers willen zien.
+3. **`curl_cffi` met `impersonate="chrome"`** - voor sites die naar de
+   TLS-vingerafdruk kijken.
+4. **De browser-container**, als die er is. Zie hieronder.
+
+Een 404 stopt de rij meteen: die pagina is er niet, en daar helpt geen andere
+poging aan. In het logboek staat welke poging het was en wat er terugkwam:
 
 ```
-eerste poging mislukt voor https://...: geblokkeerd (status 403)
-tweede poging met curl_cffi gelukt: https://...
+poging mislukt (minimale headers) voor https://...: geblokkeerd (status 403)
+opgehaald via volledige headers: https://... (status 200)
 ```
 
 Wat de meldingen betekenen:
@@ -261,16 +273,53 @@ Wat de meldingen betekenen:
 | `pagina bestaat niet meer (status 404)` | het recept is weg; geen tweede poging |
 | `Tandoor vond geen recept: No usable data could be found.` | de pagina heeft geen bruikbare schema.org-gegevens |
 
-Blokkeert een site **beide** pogingen, dan is het bijna altijd het IP en niet
-de headers. Dat is gemeten: AH weigert zelfs met exact deze headers een
-aanvraag vanaf een datacenter-IP, terwijl dezelfde aanvraag vanaf een gewone
-thuisverbinding wel doorkomt. Je NAS zit op je thuis-IP, dus daar zou het goed
-moeten gaan. Lukt het toch niet, dan blijft Tandoors eigen bookmarklet de
-uitweg: die laat je browser de HTML opsturen.
-
 Draait `curl_cffi` niet op jouw machine, dan blijft de brug gewoon werken met
-één poging; in het logboek staat dan
-`curl_cffi is niet geïnstalleerd, tweede poging overgeslagen`.
+de overige pogingen.
+
+**Weet je niet waarom een site niet lukt**, open dan dit in je browser:
+
+```
+http://<ip-van-je-nas>:8095/api/diagnose?url=https://www.ah.nl/allerhande/recept/R-R921580
+```
+
+Die probeert alle manieren náást elkaar en zegt per poging of de aanvraag
+doorkwam én of er een recept-schema in de pagina staat - dat laatste is wat
+Tandoor nodig heeft. Tandoor komt er niet aan te pas, dus het kost ook geen
+plaats in zijn importlimiet.
+
+## De browser-container
+
+Albert Heijn weigert **elke** server-side aanvraag met een 403: met de
+minimale headers, met de volledige set, en met `curl_cffi` inclusief
+TLS-vingerafdruk. Gemeten, alle drie. De reden is dat Akamai z'n
+sensor-cookies (`_abck`, `bm_sz`) pas zet nadat het JavaScript op de pagina
+gedraaid en gecontroleerd is. In je browser heb je die cookies; een client die
+dat script niet uitvoert, krijgt ze nooit.
+
+Daarom is er een tweede, optionele container: `renderer/`, met Chromium via
+Playwright. De brug vraagt hem om de pagina wanneer de gewone pogingen falen,
+én wanneer wat er binnenkomt geen recept-schema bevat - een cookiemuur komt
+namelijk met een nette 200 terug.
+
+```
+RENDERER_URL=http://tandoor-bridge-renderer:8096
+```
+
+Wat het kost: het image is ongeveer 1,2 GB, want een echte browser is groot.
+Draaiend kost het niets zolang er niets te importeren valt: de browser start
+bij het eerste verzoek en sluit zichzelf af na `BROWSER_IDLE_SECONDS` (120)
+zonder werk. Tijdens een import is het kortdurend een paar honderd MB.
+
+Importeer je geen AH, haal dan de service en `RENDERER_URL` weg. De brug
+werkt dan gewoon door met de overige pogingen en zegt bij de start:
+`geen browser-container (RENDERER_URL is leeg)`.
+
+> Zet die container **niet** open naar buiten en geef hem geen `ports`. Hij
+> haalt elke URL op die je hem geeft, dus binnen het Docker-netwerk is de
+> enige plek waar hij hoort.
+
+In `/api/status` zie je onder `browser` of hij is ingesteld, en
+`/api/diagnose` neemt hem mee als vierde poging.
 
 ## De rooktest
 
@@ -333,6 +382,7 @@ localhost, en Tandoor tegen `mock_tandoor.py`.
 | `app.py` | Flask-routes en de JSON-API |
 | `mock_tandoor.py` | nagebouwde Tandoor-API voor de tests |
 | `smoketest.py` | één recept stap voor stap tegen je echte Tandoor |
+| `renderer/` | de losse browser-container, voor sites die alles weigeren |
 
 Het heet `importqueue.py` en niet `queue.py`, omdat een `queue.py` in de
 projectmap de `queue` uit de standaardbibliotheek schaduwt — `urllib3` haalt
