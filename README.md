@@ -33,6 +33,11 @@ synoniemen, voorraad — blijft bij Tandoor. De brug geeft de HTML onbewerkt
 door, dus de bestaande Food Alias-, Unit Alias-, Never Unit- en Food
 Replace-automations doen hun werk precies zoals bij een gewone import.
 
+Bij Albert Heijn lukt zelfs dat niet: die pagina komt op **geen enkele**
+manier binnen vanaf een server. Daarvoor is er een eigen route, die het
+recept bij de app-API van AH ophaalt en er zelf een pagina van maakt. Zie
+[Albert Heijn: de app-API](#albert-heijn-de-app-api).
+
 ## Hoe het werkt
 
 Per recept drie aanroepen:
@@ -182,6 +187,7 @@ curl -X POST http://192.168.1.130:8095/api/import \
 | `POST /api/retry-failed` | alle mislukte opnieuw |
 | `GET /api/status` | tellers en of de worker draait |
 | `GET /api/check` | werkt de verbinding met Tandoor |
+| `GET /api/ah?url=...` | wat de AH-app-API van dit recept geeft, zonder Tandoor |
 | `GET /healthz` | voor de healthcheck van Docker |
 
 ### HTTP Shortcuts op Android (delen)
@@ -244,17 +250,19 @@ werkelijke limiet ongeveer 60 × het aantal workers.
 
 De brug probeert het in deze volgorde, en stopt bij de eerste die lukt:
 
-1. **`requests` met minimale headers** - alleen een User-Agent en
+1. **De AH-app-API**, alleen bij een Albert Heijn-receptlink. Zie de
+   volgende paragraaf.
+2. **`requests` met minimale headers** - alleen een User-Agent en
    `Accept-Language`. Dit is de set uit `recipe_parser`, die zich bewezen
    heeft, en hij staat vooraan om een reden: de uitgebreidere set hieronder
    bleek bij AH juist een 403 op te leveren. Akamai beoordeelt de combinatie,
    en Chrome-headers zonder bijpassende TLS-vingerafdruk zijn verdachter dan
    een kale User-Agent.
-2. **`requests` met de volledige set** - `Sec-Fetch-*`, `Sec-Ch-Ua` en de
+3. **`requests` met de volledige set** - `Sec-Fetch-*`, `Sec-Ch-Ua` en de
    rest, voor sites die juist die headers willen zien.
-3. **`curl_cffi` met `impersonate="chrome"`** - voor sites die naar de
+4. **`curl_cffi` met `impersonate="chrome"`** - voor sites die naar de
    TLS-vingerafdruk kijken.
-4. **De browser-container**, als die er is. Zie hieronder.
+5. **De browser-container**, als die er is. Zie hieronder.
 
 Een 404 stopt de rij meteen: die pagina is er niet, en daar helpt geen andere
 poging aan. In het logboek staat welke poging het was en wat er terugkwam:
@@ -287,14 +295,86 @@ doorkwam én of er een recept-schema in de pagina staat - dat laatste is wat
 Tandoor nodig heeft. Tandoor komt er niet aan te pas, dus het kost ook geen
 plaats in zijn importlimiet.
 
+## Albert Heijn: de app-API
+
+`www.ah.nl` weigert **elke** server-side aanvraag met een 403: met de minimale
+headers, met de volledige set, met `curl_cffi` inclusief TLS-vingerafdruk, en
+ook vanuit een headless Chromium. Gemeten, alle vier.
+
+Maar `api.ah.nl` — waar de Appie-app mee praat — weigert niets. Een anoniem
+token is genoeg, en daarmee geeft hij het recept gewoon terug:
+
+```
+POST https://api.ah.nl/mobile-auth/v1/auth/token/anonymous   {"clientId": "appie-ios"}
+POST https://api.ah.nl/graphql    { recipe(id: 1194169) { ... } }
+```
+
+Dus doet de brug dat voor elke AH-receptlink, vóór alle andere pogingen, en
+bouwt hij van het antwoord een pagina met het recept als JSON-LD erin. Die
+pagina gaat daarna door precies dezelfde route als elke andere:
+`POST /api/recipe-from-source/`. **Tandoor ontleedt dus nog steeds alles.**
+
+Dat laatste is de hele reden voor die omweg. AH geeft de ingrediëntregel als
+hele tekst mee, inclusief eenheid:
+
+```
+800 g zwarte bonen in blik
+100 ml La Morena chipotlesaus
+2 el arachideolie
+```
+
+Die regels gaan onbewerkt naar Tandoor, die er `800` + `g` + `zwarte bonen in
+blik` van maakt. Food Alias, Unit Alias, Never Unit en Food Replace doen
+daarna hun werk, net als bij elk ander recept. De brug ontleedt zelf niets.
+
+Wat er meekomt: titel, beschrijving, porties, bereidingstijd, de
+ingrediëntregels, de stappen, de foto in de grootste maat, en de tips (die
+komen onder de beschrijving te staan, niet tussen de stappen, want dan zou de
+nummering verschuiven). Het domein-trefwoord `www.ah.nl` komt er via de
+canonical in, dus Food Replace-regels met een bron-regex vuren ook.
+
+Werkt het? Kijk zonder Tandoor erbij:
+
+```
+http://<ip-van-je-nas>:8095/api/ah?url=https://www.ah.nl/allerhande/recept/R-R1194169/traybake
+```
+
+of vanaf de opdrachtregel:
+
+```
+python smoketest.py --ah-only --url https://www.ah.nl/allerhande/recept/R-R1194169/traybake
+```
+
+Je ziet dan welke ingrediëntregels Tandoor straks te ontleden krijgt.
+
+**Het schema van AH is niet gedocumenteerd** en introspectie staat uit, dus de
+veldnamen komen uit openbare clients die dezelfde API gebruiken. Daarom vraagt
+de brug alles buiten de kern *optioneel*: zegt AH over een veld "is
+undefined", dan laat hij dat veld vallen (of vraagt een kalere vorm) en
+probeert het opnieuw. Welke vraag werkte blijft daarna in het geheugen staan,
+dus dat kost één keer een extra ronde en niet bij elk recept. Verandert AH
+morgen iets, dan levert de brug een kaler recept in plaats van een foutmelding
+— en staat in het logboek welk veld verdwenen is:
+
+```
+AH kent images niet (meer); vraag aangepast
+```
+
+Zet AH de API helemaal dicht, dan zet je `AH_API=0`; de browser-container en
+de bookmarklet blijven over. Weigert AH ons omdat de app-versie te oud is, zet
+dan `AH_CLIENT_VERSION` (en eventueel `AH_USER_AGENT`) op de versie die nu in
+de App Store staat. Dat kan zonder nieuwe image.
+
 ## De browser-container
 
-Albert Heijn weigert **elke** server-side aanvraag met een 403: met de
-minimale headers, met de volledige set, en met `curl_cffi` inclusief
-TLS-vingerafdruk. Gemeten, alle drie. De reden is dat Akamai z'n
-sensor-cookies (`_abck`, `bm_sz`) pas zet nadat het JavaScript op de pagina
-gedraaid en gecontroleerd is. In je browser heb je die cookies; een client die
-dat script niet uitvoert, krijgt ze nooit.
+Voor Albert Heijn is de container niet meer nodig: die gaat nu via de API
+hierboven. Hij blijft er voor andere sites die hun recept pas met JavaScript
+opbouwen, of die een blokkade als gewone pagina teruggeven.
+
+De reden dat `www.ah.nl` niets doorlaat, is dat Akamai z'n sensor-cookies
+(`_abck`, `bm_sz`) pas zet nadat het JavaScript op de pagina gedraaid en
+gecontroleerd is. In je browser heb je die cookies; een client die dat script
+niet uitvoert, krijgt ze nooit.
 
 Daarom is er een tweede, optionele container: `renderer/`, met Chromium via
 Playwright. De brug vraagt hem om de pagina wanneer de gewone pogingen falen,
@@ -310,9 +390,10 @@ Draaiend kost het niets zolang er niets te importeren valt: de browser start
 bij het eerste verzoek en sluit zichzelf af na `BROWSER_IDLE_SECONDS` (120)
 zonder werk. Tijdens een import is het kortdurend een paar honderd MB.
 
-Importeer je geen AH, haal dan de service en `RENDERER_URL` weg. De brug
+Heb je hem niet nodig, haal dan de service en `RENDERER_URL` weg. De brug
 werkt dan gewoon door met de overige pogingen en zegt bij de start:
-`geen browser-container (RENDERER_URL is leeg)`.
+`geen browser-container (RENDERER_URL is leeg)`. AH blijft werken: dat gaat
+via de app-API.
 
 > Zet die container **niet** open naar buiten en geef hem geen `ports`. Hij
 > haalt elke URL op die je hem geeft, dus binnen het Docker-netwerk is de
@@ -392,14 +473,28 @@ stap en met uitleg:
 docker compose exec tandoor-bridge python smoketest.py
 docker compose exec tandoor-bridge python smoketest.py --url https://www.ah.nl/allerhande/recept/R-R921580
 docker compose exec tandoor-bridge python smoketest.py --dry-run   # niets aanmaken
+docker compose exec tandoor-bridge python smoketest.py --ah-only   # alleen de AH-route
 ```
+
+`--ah-only` heeft geen token nodig en raakt Tandoor niet aan: dat is de test
+voor de vraag of `api.ah.nl` het vanaf jouw NAS doet.
 
 ## Testen zonder je echte Tandoor
 
-`mock_tandoor.py` is een nagebouwde Tandoor-API die je los kunt draaien:
+`mock_tandoor.py` is een nagebouwde Tandoor-API die je los kunt draaien, en
+`mock_ah.py` doet hetzelfde voor de Albert Heijn-API:
 
 ```bash
 python mock_tandoor.py --throttle-after 2      # op 127.0.0.1:8099
+python mock_ah.py --zonder images tips         # op 127.0.0.1:8098
+```
+
+Met `--zonder` doet die AH alsof hij een veld niet kent, zodat je kunt zien wat
+de brug dan nog oplevert. Wijs hem aan met `AH_API_URL`:
+
+```bash
+AH_API_URL=http://127.0.0.1:8098 python smoketest.py --ah-only \
+    --url https://www.ah.nl/allerhande/recept/R-R1194169/traybake
 ```
 
 Elk token dat met `tda_` begint werkt. Hij bootst niet alleen de
@@ -416,7 +511,11 @@ verder dan de `tda_`-prefix, en de AI-endpoints.
 
 ## Wat de brug niet doet
 
-- Geen eigen ingrediëntenparser, geen categorieën, geen Bring.
+- Geen eigen ingrediëntenparser, geen categorieën, geen Bring. Ook op de
+  AH-route niet: daar gaat de hele ingrediëntregel zoals AH hem geeft naar
+  Tandoor, die hem ontleedt. Alleen als AH die regel ooit niet meegeeft, zet
+  de brug er zelf getal en naam achter elkaar — zonder eenheid, want die
+  verzint hij niet.
 - Niets wijzigen aan bestaande recepten in Tandoor. Alleen `source_url` en de
   foto van recepten die hij zelf net heeft aangemaakt.
 - Niets verwijderen.
@@ -439,10 +538,12 @@ localhost, en Tandoor tegen `mock_tandoor.py`.
 |---|---|
 | `urls.py` | links uit tekst halen, opschonen, AH-vormen, dubbel-sleutel |
 | `fetcher.py` | ophalen met browserheaders, `curl_cffi`-fallback, blokkadeherkenning |
+| `ah_api.py` | de Albert Heijn-route: app-API in, pagina met JSON-LD uit |
 | `tandoor.py` | de API-client |
 | `importqueue.py` | SQLite-wachtrij en de worker-thread |
 | `app.py` | Flask-routes en de JSON-API |
 | `mock_tandoor.py` | nagebouwde Tandoor-API voor de tests |
+| `mock_ah.py` | nagebouwde AH-API, met een instelbaar schema |
 | `smoketest.py` | één recept stap voor stap tegen je echte Tandoor |
 | `renderer/` | de losse browser-container, voor sites die alles weigeren |
 

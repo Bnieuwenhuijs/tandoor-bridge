@@ -307,6 +307,7 @@ def create_app(*, store=None, client=None, queue=None, start_worker=True,
 
     @app.get("/api/status")
     def status():
+        from ah_api import AH_API_AAN
         from fetcher import RENDERER_URL, renderer_diagnose, renderer_health
 
         return jsonify({
@@ -314,6 +315,8 @@ def create_app(*, store=None, client=None, queue=None, start_worker=True,
             "worker": queue.running,
             "delay": queue.delay,
             "tandoor": client.public_url,
+            # De AH-route: zie /api/ah?url=... om te zien of hij ook werkt.
+            "ah_api": AH_API_AAN,
             # Ingesteld zijn en antwoorden zijn twee verschillende dingen, en
             # dat verschil is precies waar je naar zoekt als AH niet lukt.
             "browser": RENDERER_URL or None,
@@ -356,6 +359,47 @@ def create_app(*, store=None, client=None, queue=None, start_worker=True,
 
         return jsonify({"url": url, "conclusie": conclusie,
                         "pogingen": pogingen}), 200
+
+    @app.get("/api/ah")
+    def ah():
+        """
+        Vraag één Albert Heijn-recept bij de app-API op en laat zien wat er komt.
+
+        Tandoor komt er niet aan te pas: dit is de knop om te kijken of de
+        AH-route werkt, en om te zien welke ingrediëntregels Tandoor straks te
+        ontleden krijgt.
+        """
+        import ah_api
+
+        url = normalize_url(request.args.get("url", ""))
+        nummer = ah_api.recipe_id_from_url(url)
+        if nummer is None:
+            return jsonify({"error": "geef een AH-receptlink mee: "
+                                     "/api/ah?url=https://www.ah.nl/allerhande/recept/R-R..."}), 400
+        if not ah_api.AH_API_AAN:
+            return jsonify({"url": url, "ok": False,
+                            "reden": "de AH-route staat uit (AH_API=0)"}), 200
+        try:
+            recept = ah_api.fetch_recipe(nummer)
+        except ah_api.AhError as e:
+            return jsonify({"url": url, "ok": False, "recept_id": nummer,
+                            "reden": e.reason, "status": e.status}), 200
+
+        schema = ah_api.to_jsonld(recept, url)
+        return jsonify({
+            "url": url, "ok": True, "recept_id": nummer,
+            "titel": schema.get("name"),
+            "porties": schema.get("recipeYield"),
+            # prepTime wordt in Tandoor de bereidingstijd, cookTime de wachttijd.
+            "bereidingstijd": schema.get("prepTime"),
+            "wachttijd": schema.get("cookTime"),
+            "foto": (schema.get("image") or [None])[0],
+            # Dit is de tekst die Tandoor straks ontleedt. Staat de eenheid er
+            # niet in, dan valt er voor Unit Alias ook niets te doen.
+            "ingredienten": schema.get("recipeIngredient"),
+            "stappen": [s["text"] for s in schema.get("recipeInstructions", [])],
+            "velden_die_ah_gaf": sorted(recept.keys()),
+        }), 200
 
     @app.get("/api/check")
     def check():

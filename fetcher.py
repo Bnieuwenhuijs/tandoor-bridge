@@ -7,7 +7,12 @@ cookbook/views/api.py), en daar zegt de botbeveiliging van onder andere
 Albert Heijn nee tegen. Hier doen we de aanvraag die er wél als een browser
 uitziet, en geven we de HTML onbewerkt terug.
 
-Twee pogingen, in deze volgorde:
+Voor Albert Heijn gaat er een poging vóór die allemaal: daar vragen we het
+recept bij api.ah.nl op, de API van de Appie-app, en bouwen we er zelf een
+pagina van. Zie ah_api.py. Dat is de enige site waar het ophalen van de
+pagina structureel niet lukt, en de enige waarvoor we een eigen route hebben.
+
+Daarna, voor elke site, in deze volgorde:
 
   1. requests met een volledige set browserheaders.
   2. curl_cffi met impersonate="chrome", voor sites die niet naar de headers
@@ -33,6 +38,8 @@ from dataclasses import dataclass
 from urllib.parse import urlsplit
 
 import requests
+
+import ah_api
 
 log = logging.getLogger(__name__)
 
@@ -218,6 +225,24 @@ def _judge(url: str, status: int, text: str, final_url: str, *, via: str) -> _At
                     result=FetchResult(url, final_url, status, text, via))
 
 
+def _attempt_ah(url: str) -> _Attempt | None:
+    """
+    Het recept bij de app-API van AH ophalen in plaats van bij de pagina.
+
+    None betekent: dit is geen AH-receptlink, of de route staat uit.
+    """
+    if not ah_api.AH_API_AAN or ah_api.recipe_id_from_url(url) is None:
+        return None
+    try:
+        html, recept = ah_api.fetch_page_html(url)
+    except ah_api.AhError as e:
+        return _Attempt(False, f"AH-API: {e.reason}", e.status)
+    log.info("recept %s bij de AH-API opgehaald: %s",
+             recept.get("id"), recept.get("title"))
+    return _Attempt(True, status=200,
+                    result=FetchResult(url, url, 200, html, "ah-api"))
+
+
 def _attempt_requests(url: str, *, timeout: int, headers=None, naam="requests") -> _Attempt:
     try:
         resp = requests.get(url, headers=headers or HEADERS_MINIMAAL,
@@ -285,6 +310,7 @@ def fetch_page(url: str, *, timeout: int = 20, impersonate: bool = True,
     redenen = []
 
     pogingen = [
+        ("AH-API", lambda: _attempt_ah(url)),
         ("minimale headers",
          lambda: _attempt_requests(url, timeout=timeout,
                                    headers=HEADERS_MINIMAAL, naam="requests")),
@@ -414,7 +440,13 @@ def probe(url: str, *, timeout: int = 20) -> list:
     Alleen voor het stellen van een diagnose: dit haalt dezelfde pagina
     meerdere keren op, dus niet gebruiken in de wachtrij.
     """
-    varianten = [
+    varianten = []
+    if ah_api.recipe_id_from_url(url) is not None:
+        # _attempt_ah() geeft None als de route uitstaat; hier weten we al dat
+        # het een AH-link is, dus dat kan alleen die reden hebben.
+        varianten.append(("AH-API", lambda: _attempt_ah(url)
+                          or _Attempt(False, "de AH-route staat uit (AH_API=0)")))
+    varianten += [
         ("requests, minimale headers",
          lambda: _attempt_requests(url, timeout=timeout,
                                    headers=HEADERS_MINIMAAL, naam="requests")),

@@ -164,6 +164,52 @@ def test_een_recept_helemaal_door_de_keten(queue, store, tandoor):
     assert state["images"]["1"] == "recept.jpg"
 
 
+def test_een_ah_recept_gaat_via_de_api_naar_tandoor(store, client, tandoor, monkeypatch):
+    """
+    De route waarvoor de brug bestaat, van link tot recept in Tandoor.
+
+    Hier draait het échte fetch_page(), dus de AH-poging zit erin. De pagina
+    van ah.nl wordt niet opgehaald: de nagebootste app-API levert het recept,
+    en Tandoor krijgt daar een pagina van te zien.
+    """
+    import ah_api
+    import mock_ah
+    from conftest import MockServer
+    from fetcher import fetch_page
+
+    ah = MockServer(mock_ah.create_app())
+    monkeypatch.setattr(ah_api, "API_URL", ah.url)
+    ah_api.reset_token()
+    ah_api.reset_schema()
+    url = "https://www.ah.nl/allerhande/recept/R-R1194169/traybake-met-kip"
+    try:
+        rij = ImportQueue(store, client, delay=0, fetch=fetch_page,
+                          fetch_photo=maak_fotofetch())
+        [item_id] = store.add([url]).added
+        uitkomst = rij.process_once()
+    finally:
+        ah.stop()
+        ah_api.reset_token()
+        ah_api.reset_schema()
+
+    assert uitkomst["status"] == KLAAR
+    item = store.item(item_id)
+    assert item["title"] == "Traybake met kip, paprika, zwarte bonen en chipotle"
+    assert item["error"] is None
+
+    recept = tandoor.state()["recipes"][0]
+    assert recept["source_url"] == url
+    # Dit is waar het om gaat: Tandoor heeft de regel ontleed, niet wij. Dus
+    # werken Food Alias, Unit Alias en de rest ook op deze recepten.
+    eerste = recept["steps"][0]["ingredients"][0]
+    assert eerste["original_text"] == "600 g kipfilet"
+    assert eerste["amount"] == 600.0
+    assert eerste["unit"]["name"] == "g"
+    assert eerste["food"]["name"] == "kipfilet"
+    # En het domein-trefwoord klopt, want de canonical wees naar ah.nl.
+    assert {"id": None, "name": "www.ah.nl"} in recept["keywords"]
+
+
 def test_een_fout_stopt_de_rest_niet(store, client):
     """Precies wat de lijst-import van Tandoor zelf verkeerd doet."""
     pogingen = []

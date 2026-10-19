@@ -326,6 +326,54 @@ def test_diagnose_zonder_url(brug):
     assert http.get("/api/diagnose").status_code == 400
 
 
+def test_ah_laat_zien_wat_de_app_api_geeft(brug, monkeypatch):
+    """De knop om te kijken of de AH-route werkt, zonder Tandoor erbij."""
+    import ah_api
+    import mock_ah
+    from conftest import MockServer
+
+    http, _, _ = brug
+    ah = MockServer(mock_ah.create_app())
+    monkeypatch.setattr(ah_api, "API_URL", ah.url)
+    ah_api.reset_token()
+    ah_api.reset_schema()
+    try:
+        data = http.get("/api/ah?url=https://www.ah.nl/allerhande/recept/"
+                        "R-R1194169/traybake-met-kip").get_json()
+    finally:
+        ah.stop()
+        ah_api.reset_token()
+        ah_api.reset_schema()
+
+    assert data["ok"] is True
+    assert data["recept_id"] == 1194169
+    assert data["porties"] == "4 personen"
+    assert data["bereidingstijd"] == "PT20M"
+    # De hele regel met eenheid: dat is wat Tandoor straks ontleedt.
+    assert data["ingredienten"][0] == "600 g kipfilet"
+    assert len(data["stappen"]) == 3
+
+
+def test_ah_meldt_netjes_dat_ah_niet_antwoordt(brug, monkeypatch):
+    import ah_api
+
+    http, _, _ = brug
+    monkeypatch.setattr(ah_api, "API_URL", "http://127.0.0.1:1")
+    ah_api.reset_token()
+    try:
+        data = http.get("/api/ah?url=https://www.ah.nl/allerhande/recept/R-R1/x").get_json()
+    finally:
+        ah_api.reset_token()
+    assert data["ok"] is False
+    assert "niet bereikbaar" in data["reden"]
+
+
+def test_ah_zonder_ah_link(brug):
+    http, _, _ = brug
+    assert http.get("/api/ah?url=https://www.leukerecepten.nl/x/").status_code == 400
+    assert http.get("/api/ah").status_code == 400
+
+
 def test_status_zegt_of_de_browser_container_antwoordt(brug, monkeypatch):
     """
     Ingesteld zijn en antwoorden zijn twee verschillende dingen. Dat verschil
