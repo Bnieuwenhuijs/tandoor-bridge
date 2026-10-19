@@ -63,6 +63,31 @@ LAUNCH_ARGS = [
     "--disable-blink-features=AutomationControlled",
 ]
 
+# Hoe vaak een challenge-pagina opnieuw geprobeerd mag worden, en hoe lang we
+# ertussen wachten. Een botbeveiliging als Akamai stuurt op de eerste aanvraag
+# geen pagina maar een script: dat draait, post telemetrie, krijgt een cookie,
+# en pas de volgende aanvraag levert het recept. Een browser doet dat zelf -
+# maar alleen als je hem de tijd geeft en daarna herlaadt. Zonder dit leest de
+# renderer de challenge-pagina en meldt 403, ook op een verbinding waar het
+# wél zou lukken.
+CHALLENGE_POGINGEN = int(os.environ.get("CHALLENGE_POGINGEN", "3"))
+CHALLENGE_WACHT_MS = int(os.environ.get("CHALLENGE_WACHT_MS", "5000"))
+
+# Waaraan je een challenge herkent in plaats van een echte pagina.
+CHALLENGE_TEKENS = ("access denied", "reference #", "just a moment",
+                    "verify you are a human", "enable javascript and cookies")
+
+
+def _is_challenge(status: int, html: str) -> bool:
+    if status in (401, 403, 429, 503):
+        return True
+    # Een challenge is klein en bevat een van deze teksten; een recept niet.
+    if len(html) < 20_000:
+        laag = html.lower()
+        return any(t in laag for t in CHALLENGE_TEKENS)
+    return False
+
+
 # Een cookiemelding staat tussen ons en het recept. Een knop zoeken op tekst
 # werkt op meer sites dan een selector per site bijhouden.
 CONSENT_TEKSTEN = (
@@ -167,6 +192,27 @@ class Renderer:
             antwoord = page.goto(url, wait_until="domcontentloaded",
                                  timeout=timeout_ms)
             status = antwoord.status if antwoord else 0
+            pogingen = [{"poging": 1, "status": status,
+                         "bytes": len(page.content())}]
+
+            # Kregen we een challenge in plaats van de pagina? Geef het script
+            # z'n tijd en herlaad. Dit is precies wat een browser normaal zelf
+            # doet; wij moeten het alleen afwachten.
+            for ronde in range(2, CHALLENGE_POGINGEN + 1):
+                if not _is_challenge(status, page.content()):
+                    break
+                log.info("challenge op %s (status %s), poging %d na %d ms",
+                         url, status, ronde, CHALLENGE_WACHT_MS)
+                page.wait_for_timeout(CHALLENGE_WACHT_MS)
+                try:
+                    antwoord = page.reload(wait_until="domcontentloaded",
+                                           timeout=timeout_ms)
+                    status = antwoord.status if antwoord else status
+                except Exception as e:
+                    log.warning("herladen mislukte: %s", e.__class__.__name__)
+                    break
+                pogingen.append({"poging": ronde, "status": status,
+                                 "bytes": len(page.content())})
 
             self._weg_met_de_cookiemelding(page)
 
@@ -193,6 +239,11 @@ class Renderer:
                 "status": status,
                 "titel": page.title(),
                 "signalen": signalen,
+                # Zodat je in de diagnose ziet of een challenge doorbroken is.
+                "pogingen": pogingen,
+                "cookies": sorted(
+                    c["name"] for c in context.cookies()
+                    if c["name"] in ("_abck", "bm_sz", "bm_sv", "ak_bmsc", "bm_mi")),
             }
         finally:
             context.close()
