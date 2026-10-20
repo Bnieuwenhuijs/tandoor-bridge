@@ -58,6 +58,11 @@ services:
       IMPORT_DELAY_SECONDS: "5"
       DATA_DIR: "/data"
       SEND_PROPERTIES: "false"
+      # AI-sortering (zie de README): leeg = de standaardprovider van de
+      # space. AI_RATELIMIT gelijk aan die van je Tandoor.
+      TANDOOR_AI_PROVIDER_ID: ""
+      AI_SORT_IMPORTS: "1"
+      AI_RATELIMIT: "60/hour"
       # Verwijst naar de tweede container hieronder, voor sites die hun recept
       # pas met JavaScript opbouwen. Leeg laten = geen browser. Albert Heijn
       # heeft hem niet nodig: dat gaat via de app-API.
@@ -147,6 +152,9 @@ services:
 #       IMPORT_DELAY_SECONDS: "5"
 #       DATA_DIR: "/data"
 #       SEND_PROPERTIES: "false"
+#       TANDOOR_AI_PROVIDER_ID: ""
+#       AI_SORT_IMPORTS: "1"
+#       AI_RATELIMIT: "60/hour"
 #       LOG_LEVEL: "INFO"
 #     ports:
 #       - "8095:8095"

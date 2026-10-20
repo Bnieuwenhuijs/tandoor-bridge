@@ -188,6 +188,11 @@ curl -X POST http://192.168.1.130:8095/api/import \
 | `GET /api/status` | tellers, of de worker draait, of de AH-route aanstaat |
 | `GET /api/diagnose?url=...` | probeert één pagina op alle manieren, zonder Tandoor |
 | `POST /bookmarklet` | waar de bookmarklet een pagina heen stuurt (formulier: `url`, `html`) |
+| `GET /api/sorteren` | de sorteerronde: fase, voortgang, AI-provider |
+| `GET /api/sorteren/items?status=` | per recept: `voorstel`, `overgeslagen`, `gesorteerd`, `mislukt`, `te_bekijken` |
+| `POST /api/sorteren/proefdraai` | proefdraai starten of hervatten; schrijft niets |
+| `POST /api/sorteren/uitvoeren` | de voorstellen schrijven |
+| `POST /api/sorteren/stop` | stoppen na het recept waar hij mee bezig is |
 | `GET /api/check` | werkt de verbinding met Tandoor |
 | `GET /api/ah?url=...` | wat de AH-app-API van dit recept geeft, zonder Tandoor |
 | `GET /healthz` | voor de healthcheck van Docker |
@@ -225,11 +230,119 @@ rest_command:
     payload: '{"url": "{{ url }}"}'
 ```
 
+## Ingrediënten bij de juiste stap (AI)
+
+Tandoor zet bij een import alle ingrediënten in de eerste stap. Tandoor kan
+ze ook zelf verdelen, met AI: dat is de knop **Automatisch sorteren** in de
+recepteditor, en achter die knop zit `POST /api/ai-step-sort/`. De brug
+gebruikt precies die functie, op twee plekken.
+
+Je hebt er een AI-provider in Tandoor voor nodig (Instellingen → AI), en
+AI-tegoed in je space.
+
+### Bij het importeren
+
+Staat er een provider, dan gaat elk nieuw recept eerst langs de sortering en
+wordt het dan aangemaakt zoals Tandoor het teruggeeft. Mislukt de AI-aanroep
+(een fout, een time-out, de limiet, het tegoed), dan wordt het recept gewoon
+ongesorteerd aangemaakt, en staat de reden in de geschiedenis:
+`ongesorteerd: het AI-tegoed van de space is op`. Weigert Tandoor wat de AI
+teruggaf, dan ook: ongesorteerd, met de reden.
+
+**Welke provider:** `TANDOOR_AI_PROVIDER_ID` in de `.env` als je die zet.
+Anders de standaardprovider van je space, en anders de enige die er is. Zijn
+er meer en is er geen standaard, dan sorteert de brug niet en zegt hij welke
+ids er zijn: elke aanroep kost tegoed, dus hij gokt niet. Welke hij gebruikt,
+staat in het tabblad **Sorteren** en bij de start in het logboek. Uitzetten
+voor nieuwe recepten: `AI_SORT_IMPORTS=0`.
+
+### Voor recepten die er al staan: het tabblad Sorteren
+
+> **Maak eerst een back-up van je Tandoor-database.** Uitvoeren schrijft in
+> je bestaande recepten. Op TrueNAS is een snapshot van de dataset waarin de
+> database van Tandoor staat het snelst, en het snelst terug te zetten. Anders
+> een dump vanuit de databasecontainer:
+>
+> ```bash
+> docker exec <postgres-container> pg_dump -U <gebruiker> <database> > tandoor-voor-sorteren.sql
+> ```
+>
+> De gebruiker en de database staan in de omgeving van je Tandoor-app
+> (`POSTGRES_USER`, `POSTGRES_DB`).
+
+Twee knoppen, met een moment ertussen om te kijken:
+
+1. **Proefdraai** haalt elk recept op en schrijft niets. Hij slaat over:
+   recepten waarvan de ingrediënten al over meer stappen verdeeld zijn,
+   recepten zonder ingrediënten of zonder stappen, en recepten waar de AI
+   niets aan verandert. Voor de rest vraagt hij de AI om een indeling, en
+   laat per recept zien: het aantal stappen voor en na, en welk ingrediënt
+   naar welke stap gaat.
+2. **Uitvoeren** schrijft precies die voorstellen. Geen nieuwe AI-vraag, want
+   die kan iets anders opleveren dan wat je net zag. Is een recept sinds de
+   proefdraai veranderd, dan slaat hij het over (mislukt, met de reden); de
+   volgende proefdraai bekijkt het opnieuw.
+
+Het draait op de achtergrond op de NAS: je kunt de pagina dichtdoen. Er is
+een stopknop, en na een herstart van de container gaat de ronde verder waar
+hij was. Een nieuwe proefdraai na "stop" gaat ook verder, en vraagt niet
+opnieuw wat al bekeken is - dat heeft tegoed gekost. Alleen wat mislukte,
+wordt opnieuw bekeken. Wat al gesorteerd is, blijft met rust.
+
+Tussen twee AI-vragen wacht de ronde de tijd die bij `AI_RATELIMIT` hoort
+(standaard `60/hour`, dus een minuut; zelfde schrijfwijze als in Tandoor). Is
+het tegoed van je space op, dan stopt de ronde met die melding en blijven de
+overige recepten wachten. Vul het aan en druk weer op Proefdraai.
+
+**Wat er bij een bestaand recept verandert:** de stappen (de AI mag ze
+splitsen) en welk ingrediënt bij welke stap hoort. Verder niets: de
+hoeveelheid, eenheid en food van een ingrediënt schrijft de brug niet, ook
+niet als de AI ze anders teruggeeft. Er wordt niets verwijderd. Een stap die
+de AI samenvoegt, wordt van het recept losgekoppeld maar blijft in de
+database staan.
+
+**Hoe dat veilig gaat** volgt uit hoe Tandoor een recept bijwerkt (zie
+[hieronder](#wat-in-de-tandoor-broncode-bleek-te-staan)):
+
+- Alleen ids uit dít recept. Tandoor zoekt een id in de hele database op, dus
+  een id dat de AI verzint of verwisselt, zou een stap van een ander recept
+  bijwerken.
+- Elk ingrediënt in precies één stap. Zet de AI er een in twee stappen, dan
+  telt de eerste. Laat de AI er een weg, dan blijft het in stap 1. Dat staat
+  dan bij het voorstel.
+- Per ingrediënt alleen id en volgorde, zodat er geen food wordt beschreven -
+  die hoort bij al je recepten.
+- Nieuwe stappen eerst leeg aanmaken, dan alles in één keer verplaatsen. Geen
+  van beide aanvragen kan halverwege op validatie stuklopen, en dat moet, want
+  Tandoor gebruikt geen transactie.
+- Daarna wordt nagekeken of het recept staat zoals bedoeld. Zo niet, of mislukt
+  een aanvraag, dan zet de brug de oude indeling terug.
+
+### De limiet geldt voor import én AI samen
+
+In Tandoor tellen de AI en de import mee in **dezelfde** teller (allebei een
+`UserRateThrottle` zonder eigen scope, dus dezelfde cachesleutel). Elke import
+is één aanvraag, elke sortering nog een. Bij `AI_RATELIMIT=60/hour` en een
+grote lijst raakt de AI dus na ongeveer dertig recepten per uur op z'n
+limiet, ook als jij de importlimiet hoger hebt gezet. Die recepten worden
+ongesorteerd aangemaakt, met de reden erbij.
+
+Twee manieren om daarmee om te gaan:
+
+- **Eerst importeren, later sorteren.** Laat de lijst gewoon lopen en draai
+  daarna het tabblad Sorteren: dat pakt alle ongesorteerde recepten op, in
+  z'n eigen tempo.
+- **Alles meteen sorteren.** Zet `IMPORT_DELAY_SECONDS=130` zolang de lijst
+  loopt: dan blijven import en AI samen onder de 60 per uur (120 is precies
+  60, en dan zit je er net op).
+
 ## De limiet van 60 per uur
 
-Alleen de importroute van Tandoor is afgeknepen:
-`DRF_THROTTLE_RECIPE_URL_IMPORT`, standaard `60/hour`. Het aanmaken van een
-recept en het uploaden van een foto zijn niet afgeknepen.
+De importroute van Tandoor is afgeknepen: `DRF_THROTTLE_RECIPE_URL_IMPORT`,
+standaard `60/hour`. De AI-sortering ook (`AI_RATELIMIT`), en die twee delen
+één teller - zie [hierboven](#de-limiet-geldt-voor-import-én-ai-samen). Het
+aanmaken van een recept, het bijwerken ervan en het uploaden van een foto
+zijn niet afgeknepen.
 
 De brug gaat daar netjes mee om: bij een `429` wacht hij de `Retry-After` af
 en gaat daarna door, en het item blijft in de rij staan. Een lijst van 233
@@ -529,8 +642,11 @@ verder dan de `tda_`-prefix, en de AI-endpoints.
   woord als eenheid lezen (`400 zwarte bonen` → eenheid `zwarte`), dus komt het
   getal dan tussen haakjes achter de naam en in de notitie.
 - Niets wijzigen aan bestaande recepten in Tandoor. Alleen `source_url` en de
-  foto van recepten die hij zelf net heeft aangemaakt.
-- Niets verwijderen.
+  foto van recepten die hij zelf net heeft aangemaakt - en de stappen en de
+  ingrediëntindeling, maar alleen als jij in het tabblad Sorteren op
+  **Uitvoeren** drukt.
+- Niets verwijderen. Ook niet bij het sorteren: een stap die de AI samenvoegt,
+  wordt losgekoppeld en blijft in de database.
 - Geen voedingswaarden meesturen (standaard uit, zie `SEND_PROPERTIES`).
   Tandoor schrijft daarbij de naam uit het verzoek op het bestaande
   `PropertyType` in je ruimte, en dat is een wijziging aan de inrichting van
@@ -553,8 +669,11 @@ localhost, en Tandoor tegen `mock_tandoor.py`.
 | `ah_api.py` | de Albert Heijn-route: app-API in, pagina met JSON-LD uit |
 | `tandoor.py` | de API-client |
 | `importqueue.py` | SQLite-wachtrij en de worker-thread |
+| `sorteren.py` | AI-sortering: provider kiezen, plan maken, veilig schrijven |
+| `sorteerronde.py` | de sorteerronde voor bestaande recepten, als achtergrondtaak |
 | `app.py` | Flask-routes en de JSON-API |
 | `mock_tandoor.py` | nagebouwde Tandoor-API voor de tests |
+| `mock_opslag.py` | de recepten van die mock, bijgewerkt zoals Tandoor geneste stappen bijwerkt |
 | `mock_ah.py` | nagebouwde AH-API, met een instelbaar schema |
 | `smoketest.py` | één recept stap voor stap tegen je echte Tandoor |
 | `renderer/` | de losse browser-container, voor sites die alles weigeren |
@@ -610,12 +729,19 @@ mislukken, dus het staat hier voor de volgende keer:
   bij de overige recept-endpoints.
 - **Een lege `PUT` naar het afbeeldingsendpoint wist de foto.** Er is geen
   manier om die aanroep niets te laten doen.
-
-## Later, niet in deze versie
-
-Tandoor heeft een AI-functie die receptstappen opsplitst en ingrediënten aan
-de juiste stap koppelt (`POST /api/ai-step-sort/`, in de interface
-"Automatisch sorteren"). Dat vraagt een geconfigureerde AI-provider en is
-beperkt tot ongeveer 60 aanroepen per uur. De plek ervoor zit er al: het zou
-een vinkje "ook stappen koppelen" worden, tussen stap 1 en stap 2 van de
-importflow.
+- **De AI-limiet en de importlimiet delen één teller.** `AiEndpointThrottle` en
+  `RecipeImportThrottle` zijn allebei een `UserRateThrottle` zonder eigen
+  `scope`, dus allebei `throttle_user_<id>`. Elke import telt mee voor de AI.
+- **`ai-step-sort` slaat niets op, en controleert het antwoord van het model
+  niet** (`# TODO validate` staat in de view). Een verkeerd provider-id geeft
+  een 500 in plaats van een 400, en de melding over op-zijnde tegoed is tekst
+  zonder foutcode.
+- **Geneste stappen en ingrediënten bijwerken** gaat via
+  `drf-writable-nested` 0.7.2, en dat doet vier dingen die je moet weten
+  voordat je een bestaand recept aanraakt: een id wordt in de hele database
+  opgezocht, niet in het recept; wat uit een lijst valt wordt losgekoppeld,
+  niet verwijderd; een nieuw genest object is nooit partial, ook niet voor de
+  bestaande ingrediënten eronder; en een food die met een id meekomt, wordt
+  zelf ook bijgewerkt.
+- **Er is geen transactie om een aanvraag.** Geen `ATOMIC_REQUESTS`: valt de
+  derde stap om, dan zijn de eerste twee al opgeslagen.
