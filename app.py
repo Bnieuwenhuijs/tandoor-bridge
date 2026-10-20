@@ -132,7 +132,7 @@ def _bookmarklet_pagina(kop: str, tekst: str, link: str | None) -> str:
 
 
 def create_app(*, store=None, client=None, queue=None, start_worker=True,
-               config=None) -> Flask:
+               config=None, ronde=None) -> Flask:
     """
     Zet de app in elkaar.
 
@@ -151,13 +151,20 @@ def create_app(*, store=None, client=None, queue=None, start_worker=True,
         )
     if store is None:
         store = Store(_schrijfbare_datamap(instellingen["data_dir"]) / "bridge.sqlite3")
-    if queue is None:
-        sorteerder = None
-        if instellingen.get("ai_sort_imports", True):
-            from sorteren import Sorteerder
+    from sorteerronde import SorteerRonde, SorteerStore, pauze_uit_limiet
+    from sorteren import Sorteerder
 
-            sorteerder = Sorteerder(client, provider_id=instellingen.get("ai_provider_id", ""))
-        queue = ImportQueue(store, client, delay=instellingen["delay"], sorteerder=sorteerder)
+    # Eén sorteerder voor de import en de ronde: dan wordt de provider maar op
+    # één plek opgezocht en onthouden.
+    sorteerder = Sorteerder(client, provider_id=instellingen.get("ai_provider_id", ""))
+    if queue is None:
+        queue = ImportQueue(store, client, delay=instellingen["delay"],
+                            sorteerder=sorteerder if instellingen.get("ai_sort_imports", True)
+                            else None)
+    if ronde is None:
+        # Dezelfde database als de wachtrij, met een eigen tabel.
+        ronde = SorteerRonde(SorteerStore(store.path), client, sorteerder,
+                             ai_pauze=pauze_uit_limiet(instellingen.get("ai_ratelimit", "")))
 
     app = Flask(__name__)
     app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
@@ -165,11 +172,12 @@ def create_app(*, store=None, client=None, queue=None, start_worker=True,
     # stuurt een hele receptpagina mee. Zonder dit krijg je een 413 zonder
     # uitleg zodra een pagina iets groter is dan gemiddeld.
     app.config["MAX_FORM_MEMORY_SIZE"] = 16 * 1024 * 1024
-    app.store, app.client, app.queue = store, client, queue
+    app.store, app.client, app.queue, app.ronde = store, client, queue, ronde
     app.bridge_config = instellingen
 
     if start_worker:
         queue.start()
+        ronde.start()
         # Hier en niet in main(): gunicorn roept main() nooit aan, dus daar
         # kwamen deze regels in de container nooit in het logboek.
         _meld_start(client, instellingen)
@@ -303,9 +311,13 @@ def create_app(*, store=None, client=None, queue=None, start_worker=True,
         except (TypeError, ValueError):
             limiet = 100
         limiet = max(1, min(limiet, 1000))   # een negatieve limiet haalde de grens eruit
+        sorteerstand = ronde.store.ronde()
         return jsonify({
             "items": [verrijk(i) for i in store.items(status=status, limit=limiet)],
             "counts": store.counts(),
+            # Zodat het importtabblad ook laat zien dat er een ronde loopt.
+            "sorteren": {"actief": bool(sorteerstand["actief"]),
+                         "modus": sorteerstand["modus"]},
         }), 200
 
     @app.post("/api/items/<int:item_id>/retry")
@@ -419,6 +431,49 @@ def create_app(*, store=None, client=None, queue=None, start_worker=True,
             "stappen": [s["text"] for s in schema.get("recipeInstructions", [])],
             "velden_die_ah_gaf": sorted(recept.keys()),
         }), 200
+
+    # ---------------------------------------------------------- sorteren
+
+    @app.get("/api/sorteren")
+    def sorteren_status():
+        return jsonify(ronde.status()), 200
+
+    @app.get("/api/sorteren/items")
+    def sorteren_items():
+        status = request.args.get("status") or None
+        try:
+            limiet = max(1, min(int(request.args.get("limit", 500)), 2000))
+        except (TypeError, ValueError):
+            limiet = 500
+        uit = []
+        for item in ronde.store.items(status=status, limit=limiet):
+            # Het plan zelf blijft in de database; de pagina heeft genoeg aan
+            # de samenvatting, en de link naar het recept.
+            plan = item.pop("plan", None)
+            uit.append({**item, "plan_klaar": plan is not None,
+                        "link": client.recipe_url(item["recipe_id"])})
+        return jsonify({"items": uit, "tellingen": ronde.store.tellingen()}), 200
+
+    @app.post("/api/sorteren/proefdraai")
+    def sorteren_proefdraai():
+        from sorteerronde import PROEFDRAAI
+
+        if fout := ronde.begin(PROEFDRAAI):
+            return jsonify({"error": fout}), 409
+        return jsonify({"melding": "proefdraai gestart; er wordt niets geschreven"}), 200
+
+    @app.post("/api/sorteren/uitvoeren")
+    def sorteren_uitvoeren():
+        from sorteerronde import UITVOEREN
+
+        if fout := ronde.begin(UITVOEREN):
+            return jsonify({"error": fout}), 409
+        return jsonify({"melding": "uitvoeren gestart"}), 200
+
+    @app.post("/api/sorteren/stop")
+    def sorteren_stop():
+        ronde.stop()
+        return jsonify({"melding": "gestopt na het recept waar hij nu mee bezig is"}), 200
 
     @app.get("/api/check")
     def check():

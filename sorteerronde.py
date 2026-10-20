@@ -194,6 +194,9 @@ class SorteerStore:
         if status == "voorstel":
             sql += " WHERE status = ? AND plan IS NOT NULL"
             args.append(WACHTEND)
+        elif status == "te_bekijken":
+            sql += " WHERE status = ? AND plan IS NULL"
+            args.append(WACHTEND)
         elif status:
             sql += " WHERE status = ?"
             args.append(status)
@@ -394,6 +397,10 @@ class SorteerRonde:
             plan = sorteren.maak_plan(recept, antwoord)
         except sorteren.PlanFout as e:
             self.store.zet(rid, MISLUKT, reden=str(e), naam=naam)
+            return self.ai_pauze
+        if not sorteren.verandert_iets(recept, plan):
+            self.store.zet(rid, OVERGESLAGEN, reden="de AI liet het recept zoals het was",
+                           naam=naam)
             return self.ai_pauze
         self.store.zet(rid, WACHTEND, plan=plan, naam=naam,
                        samenvatting=sorteren.samenvatting(recept, plan))

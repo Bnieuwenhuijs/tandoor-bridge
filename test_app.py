@@ -491,3 +491,66 @@ def test_ah_geeft_bij_een_onverwachte_fout_toch_een_antwoord(brug, monkeypatch):
     antwoord = http.get("/api/ah?url=https://www.ah.nl/allerhande/recept/R-R1/x")
     assert antwoord.status_code == 200
     assert "ZeroDivisionError" in antwoord.get_json()["reden"]
+
+
+# ---------------------------------------------------------------- sorteren
+
+@pytest.fixture
+def brug_met_ronde(tmp_path, client):
+    from sorteerronde import SorteerRonde, SorteerStore
+    from sorteren import Sorteerder
+
+    store = Store(tmp_path / "bridge.sqlite3")
+    ronde = SorteerRonde(SorteerStore(store.path), client, Sorteerder(client),
+                         ai_pauze=0, schrijf_pauze=0)
+    app = create_app(store=store, client=client, queue=ImportQueue(store, client, delay=0),
+                     ronde=ronde, start_worker=False)
+    app.config.update(TESTING=True)
+    with app.test_client() as http:
+        yield http, ronde
+
+
+def _recept(tandoor):
+    import requests
+
+    requests.post(f"{tandoor.url}/api/recipe/", headers={"Authorization": "Bearer tda_x"},
+                  json={"name": "Soep", "steps": [
+                      {"instruction": "Snipper de ui.", "ingredients": [
+                          {"food": {"name": "ui"}, "unit": None, "amount": 1, "order": 0},
+                          {"food": {"name": "wortel"}, "unit": None, "amount": 2, "order": 1}]},
+                      {"instruction": "Kook de wortel.", "ingredients": []}]})
+
+
+def test_sorteren_van_proefdraai_tot_uitvoeren(brug_met_ronde, tandoor):
+    http, ronde = brug_met_ronde
+    _recept(tandoor)
+
+    status = http.get("/api/sorteren").get_json()
+    assert status["provider"]["id"] == 1 and status["ronde"]["actief"] == 0
+
+    assert http.post("/api/sorteren/uitvoeren").status_code == 409   # nog geen voorstel
+    assert http.post("/api/sorteren/proefdraai").status_code == 200
+    assert http.post("/api/sorteren/proefdraai").status_code == 409  # loopt al
+    while ronde.store.ronde()["actief"]:
+        ronde.stap()
+
+    [item] = http.get("/api/sorteren/items?status=voorstel").get_json()["items"]
+    assert item["plan_klaar"] is True and "plan" not in item
+    assert item["link"].endswith("/recipe/1")
+    assert item["samenvatting"]["stappen_na"] == 2
+
+    assert http.post("/api/sorteren/uitvoeren").status_code == 200
+    while ronde.store.ronde()["actief"]:
+        ronde.stap()
+    [klaar] = http.get("/api/sorteren/items?status=gesorteerd").get_json()["items"]
+    assert klaar["recipe_id"] == 1
+
+
+def test_stoppen_via_de_api(brug_met_ronde, tandoor):
+    http, ronde = brug_met_ronde
+    _recept(tandoor)
+    http.post("/api/sorteren/proefdraai")
+    assert http.get("/api/items").get_json()["sorteren"] == {"actief": True, "modus": "proefdraai"}
+    http.post("/api/sorteren/stop")
+    assert ronde.store.ronde()["actief"] == 0
+    assert http.get("/api/items").get_json()["sorteren"]["actief"] is False

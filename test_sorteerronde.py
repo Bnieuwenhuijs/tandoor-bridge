@@ -297,3 +297,26 @@ def test_de_thread_draait_de_ronde_af(ronde, tandoor):
 ])
 def test_pauze_uit_de_limiet(limiet, pauze):
     assert pauze_uit_limiet(limiet) == pytest.approx(pauze)
+
+
+def test_een_recept_waar_de_ai_niets_aan_verandert_is_geen_voorstel(ronde, tandoor):
+    # Eén stap, en de AI splitst niet: dan blijft alles zoals het was, en
+    # uitvoeren zou alleen hetzelfde nog eens wegschrijven.
+    rid = maak(tandoor, [{"instruction": "Alles in de pan.",
+                          "ingredients": [_ingr("ui", 0), _ingr("wortel", 1)]}])
+    ronde.begin(PROEFDRAAI)
+    draai(ronde)
+    item = ronde.store.item(rid)
+    assert item["status"] == OVERGESLAGEN
+    assert item["reden"] == "de AI liet het recept zoals het was"
+    assert "doe eerst een proefdraai" in ronde.begin(UITVOEREN)
+
+
+def test_te_bekijken_is_een_eigen_filter(ronde, tandoor):
+    for n in range(2):
+        maak(tandoor, SORTEERBAAR, f"Soep {n}")
+    ronde.begin(PROEFDRAAI)
+    ronde.stap()
+    ronde.stap()
+    assert [i["naam"] for i in ronde.store.items(status="te_bekijken")] == ["Soep 1"]
+    assert [i["naam"] for i in ronde.store.items(status="voorstel")] == ["Soep 0"]

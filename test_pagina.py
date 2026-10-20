@@ -59,7 +59,7 @@ let antwoordGever = () => { throw new Error('geen netwerk'); };
 globalThis.fetch = async (pad, opties) => antwoordGever(pad, opties);
 
 const bron = fs.readFileSync(process.argv[2], 'utf8')
-  + '\\n;globalThis.__t = { ververs, vraag };';
+  + '\\n;globalThis.__t = { ververs, vraag, toonTab, sorteerregel };';
 vm.runInThisContext(bron);
 
 function wacht() {
@@ -103,6 +103,35 @@ function wacht() {
   // 5. De bookmarklet moet naar deze host wijzen en een formulier posten.
   uitkomst.bookmarklet = elementen['bookmarklet']
     ? (elementen['bookmarklet'].href || '') : '';
+
+  // 6. De tabbladen wisselen, en de knoppen zeggen welk er open is.
+  globalThis.__t.toonTab('sorteren');
+  uitkomst.na_sorteren = {
+    importeren: elementen['paneel-importeren'].hidden,
+    sorteren: elementen['paneel-sorteren'].hidden,
+    knop: elementen['tab-sorteren']['aria-selected'],
+  };
+  globalThis.__t.toonTab('importeren');
+  uitkomst.na_importeren = {
+    importeren: elementen['paneel-importeren'].hidden,
+    sorteren: elementen['paneel-sorteren'].hidden,
+    knop: elementen['tab-importeren']['aria-selected'],
+  };
+
+  // 7. Een voorstel laat per stap zien welke ingrediënten erin komen.
+  const li = globalThis.__t.sorteerregel({
+    recipe_id: 4, naam: 'Soep', status: 'wachtend', plan_klaar: true, reden: null,
+    link: 'http://tandoor/recipe/4', bijgewerkt: '2026-10-20T10:00:00+00:00',
+    samenvatting: { stappen_voor: 1, stappen_na: 2, notities: ['1 ingrediënt liet de AI weg'],
+      toewijzing: [{ ingredient: '1 ui', stap: 1 }, { ingredient: '2 wortels', stap: 2 },
+                   { ingredient: 'zout', stap: 2 }] },
+  });
+  const teksten = [];
+  (function verzamel(knoop) {
+    if (knoop.textContent) teksten.push(knoop.textContent);
+    (knoop.children || []).forEach(verzamel);
+  })(li);
+  uitkomst.voorstel = teksten;
 
   console.log(JSON.stringify(uitkomst));
 })();
@@ -177,3 +206,28 @@ def test_de_bookmarklet_post_een_formulier_naar_deze_host(tmp_path):
     # En hij stuurt de pagina mee die de browser zelf ziet.
     assert "document.documentElement.outerHTML" in code
     assert "a('url',location.href)" in code
+
+
+def test_importeren_is_het_tabblad_waarmee_de_pagina_opent():
+    """In de HTML zelf: de JavaScript hoeft daar niets voor te doen."""
+    html = PAGINA.read_text(encoding="utf-8")
+    sorteren = re.search(r'<div id="paneel-sorteren"[^>]*>', html).group(0)
+    importeren = re.search(r'<div id="paneel-importeren"[^>]*>', html).group(0)
+    assert " hidden" in sorteren and " hidden" not in importeren
+    knop = re.search(r'<button[^>]*id="tab-importeren"[^>]*>', html, re.S).group(0)
+    assert 'aria-selected="true"' in knop
+
+
+def test_de_tabbladen_wisselen(tmp_path):
+    uitkomst = draai_pagina(tmp_path)
+    assert uitkomst["na_sorteren"] == {"importeren": True, "sorteren": False, "knop": "true"}
+    assert uitkomst["na_importeren"] == {"importeren": False, "sorteren": True, "knop": "true"}
+
+
+def test_een_voorstel_laat_de_indeling_per_stap_zien(tmp_path):
+    teksten = draai_pagina(tmp_path)["voorstel"]
+    assert "1 → 2 stappen" in teksten
+    assert "Stap 1: 1 ui" in teksten
+    assert "Stap 2: 2 wortels, zout" in teksten
+    assert "1 ingrediënt liet de AI weg" in teksten
+    assert "Voorstel" in teksten                      # de badge

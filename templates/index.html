@@ -125,6 +125,21 @@ input[type=file] { font: inherit; max-width: 100%; }
   text-decoration: none; font-weight: 500; cursor: grab;
 }
 .rij { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
+.tabs { display: flex; gap: 4px; margin: 0 0 16px; border-bottom: 1px solid var(--rand); }
+.tab {
+  background: none; border: none; border-bottom: 2px solid transparent; border-radius: 0;
+  padding: 10px 14px; min-height: 44px; color: var(--zacht); font: inherit; cursor: pointer;
+}
+.tab[aria-selected="true"] { color: var(--tekst); border-bottom-color: var(--accent); font-weight: 500; }
+.badge.gesorteerd { color: var(--groen); }
+.badge.overgeslagen { color: var(--amber); }
+.badge.voorstel, .badge.te_bekijken { color: var(--blauw); }
+.waarschuwing {
+  padding: 10px 12px; border-radius: 8px; font-size: 14px; margin: 0 0 12px;
+  border: 1px solid var(--amber); color: var(--amber);
+}
+.indeling { margin: 6px 0 0; padding-left: 18px; font-size: 13px; color: var(--zacht); }
+.indeling li { margin: 2px 0; overflow-wrap: anywhere; }
 </style>
 </head>
 <body>
@@ -134,6 +149,15 @@ input[type=file] { font: inherit; max-width: 100%; }
   <h1>Tandoor Bridge</h1>
   <div class="statusregel" id="statusregel" aria-live="polite">bezig met laden…</div>
 </header>
+
+<nav class="tabs" role="tablist">
+  <button class="tab" id="tab-importeren" role="tab" aria-selected="true"
+          aria-controls="paneel-importeren">Importeren</button>
+  <button class="tab" id="tab-sorteren" role="tab" aria-selected="false"
+          aria-controls="paneel-sorteren">Sorteren</button>
+</nav>
+
+<div id="paneel-importeren" role="tabpanel" aria-labelledby="tab-importeren">
 
 <section class="kaart">
   <h2>Recepten importeren</h2>
@@ -162,8 +186,8 @@ input[type=file] { font: inherit; max-width: 100%; }
     Sommige sites weigeren elke aanvraag van de NAS, ook die van een echte
     browser daarop. Jouw browser komt er wél door, want die heeft de cookies
     en voert hun JavaScript uit. (Albert Heijn hoort daar niet meer bij: die
-    gaat via de app van AH, gewoon in de wachtrij.) Sleep deze knop naar je bladwijzerbalk; sta je
-    op zo'n receptpagina, klik hem dan aan.
+    gaat via de app van AH, gewoon in de wachtrij.) Sleep deze knop naar je
+    bladwijzerbalk; sta je op zo'n receptpagina, klik hem dan aan.
   </p>
   <p><a id="bookmarklet" class="bookmarkletknop" href="#">Recept naar Tandoor</a></p>
   <p class="sub"><strong>Slepen, niet klikken</strong> — hier op deze pagina
@@ -190,6 +214,41 @@ input[type=file] { font: inherit; max-width: 100%; }
 
 </div>
 
+<div id="paneel-sorteren" role="tabpanel" aria-labelledby="tab-sorteren" hidden>
+
+<section class="kaart">
+  <h2>Ingrediënten bij de juiste stap</h2>
+  <p class="waarschuwing"><strong>Maak eerst een back-up van je Tandoor-database.</strong>
+    Uitvoeren schrijft in je bestaande recepten: de stappen en welk ingrediënt
+    bij welke stap hoort.</p>
+  <p class="sub" style="margin-top:0">
+    Tandoors eigen AI-sortering, voor recepten die er al staan. De
+    <strong>proefdraai</strong> schrijft niets: hij laat per recept zien wat er
+    zou gebeuren. Pas <strong>Uitvoeren</strong> schrijft, en dan precies dat
+    voorstel. Recepten waarvan de ingrediënten al over meer stappen verdeeld
+    zijn, of die geen ingrediënten of stappen hebben, worden overgeslagen.
+  </p>
+  <div class="sub" id="ai-provider">AI-provider: bezig met opzoeken…</div>
+  <div class="melding" id="sorteer-melding" aria-live="polite">bezig met laden…</div>
+  <div class="sub" id="sorteer-bezig" hidden></div>
+  <div class="knoppen">
+    <button id="knop-proefdraai">Proefdraai</button>
+    <button id="knop-uitvoeren" class="primair" disabled>Uitvoeren</button>
+    <button id="knop-stop" hidden>Stop</button>
+  </div>
+  <div id="sorteer-knopmelding"></div>
+</section>
+
+<section class="kaart">
+  <h2 style="margin:0 0 12px">Per recept</h2>
+  <div class="chips" id="sorteer-filters" role="group" aria-label="Filter op status"></div>
+  <ul id="sorteer-lijst"></ul>
+</section>
+
+</div>
+
+</div>
+
 <script>
 "use strict";
 
@@ -199,6 +258,8 @@ const LABELS = {
   klaar: "Klaar", mislukt: "Mislukt", bestaat_al: "Bestaat al",
   nieuw: "Nieuw", al_geimporteerd: "Al geïmporteerd",
   in_wachtrij: "In de wachtrij", eerder_mislukt: "Eerder mislukt",
+  overgeslagen: "Overgeslagen", gesorteerd: "Gesorteerd",
+  voorstel: "Voorstel", te_bekijken: "Te bekijken",
 };
 const FILTERS = [
   ["", "Alles"], ["mislukt", "Mislukt"], ["klaar", "Klaar"],
@@ -414,6 +475,7 @@ async function ververs() {
     if (onderweg) stukken.push(`${onderweg} in de wachtrij`);
     if (counts.klaar) stukken.push(`${counts.klaar} geïmporteerd`);
     if (counts.mislukt) stukken.push(`${counts.mislukt} mislukt`);
+    if (data.sorteren && data.sorteren.actief) stukken.push(`sorteren: ${data.sorteren.modus} loopt`);
     $("statusregel").textContent = stukken.length ? stukken.join(" · ") : "nog niets te doen";
   } finally {
     // Ook ná een fout opnieuw inplannen. Zonder deze finally stopte de
@@ -424,7 +486,143 @@ async function ververs() {
   }
 }
 
+// ---------------------------------------------------------------- tabbladen
+
+function toonTab(naam) {
+  for (const tab of ["importeren", "sorteren"]) {
+    const actief = tab === naam;
+    $("tab-" + tab).setAttribute("aria-selected", actief ? "true" : "false");
+    $("paneel-" + tab).hidden = !actief;
+  }
+  if (naam === "sorteren") ververSorteren();
+}
+
+// ---------------------------------------------------------------- sorteren
+
+const SORTEERFILTERS = [
+  ["voorstel", "Voorstellen"], ["overgeslagen", "Overgeslagen"],
+  ["gesorteerd", "Gesorteerd"], ["mislukt", "Mislukt"], ["te_bekijken", "Te bekijken"],
+];
+let sorteerfilter = "voorstel";
+let sorteertimer = null;
+
+function sorteerknoppen(tellingen) {
+  const vak = $("sorteer-filters");
+  vak.innerHTML = "";
+  for (const [waarde, naam] of SORTEERFILTERS) {
+    const knop = el("button", "chip", `${naam} (${tellingen[waarde] || 0})`);
+    knop.setAttribute("aria-pressed", String(sorteerfilter === waarde));
+    knop.addEventListener("click", () => { sorteerfilter = waarde; ververSorteren(); });
+    vak.appendChild(knop);
+  }
+}
+
+function sorteerregel(item) {
+  const li = el("li", "regel");
+  const inhoud = el("div", "inhoud");
+  const titel = el("div", "titel");
+  if (item.link) {
+    const link = el("a", null, item.naam || `Recept ${item.recipe_id}`);
+    link.setAttribute("href", item.link);
+    link.setAttribute("target", "_blank");
+    link.setAttribute("rel", "noopener");
+    titel.appendChild(link);
+  } else {
+    titel.textContent = item.naam || `Recept ${item.recipe_id}`;
+  }
+  inhoud.appendChild(titel);
+
+  const s = item.samenvatting;
+  if (item.status === "mislukt" && item.reden) {
+    inhoud.appendChild(el("div", "fout", item.reden));
+  } else if (item.reden) {
+    inhoud.appendChild(el("div", "sub", item.reden));
+  }
+  if (s) {
+    // Bij "gesorteerd" zegt de reden dit al.
+    if (item.status !== "gesorteerd") {
+      inhoud.appendChild(el("div", "sub", `${s.stappen_voor} → ${s.stappen_na} stappen`));
+    }
+    // Per stap welke ingrediënten erin komen; een stap zonder ingrediënten
+    // noemen we niet, die zegt hier niets.
+    const perStap = {};
+    for (const t of s.toewijzing || []) (perStap[t.stap] = perStap[t.stap] || []).push(t.ingredient);
+    const lijst = el("ul", "indeling");
+    for (const stap of Object.keys(perStap).sort((a, b) => a - b)) {
+      lijst.appendChild(el("li", null, `Stap ${stap}: ${perStap[stap].join(", ")}`));
+    }
+    inhoud.appendChild(lijst);
+    for (const notitie of s.notities || []) inhoud.appendChild(el("div", "sub", notitie));
+  }
+  inhoud.appendChild(el("div", "sub", tijd(item.bijgewerkt)));
+  li.appendChild(inhoud);
+  const status = item.status === "wachtend" ? (item.plan_klaar ? "voorstel" : "te_bekijken")
+                                            : item.status;
+  li.appendChild(badge(status));
+  return li;
+}
+
+async function ververSorteren() {
+  let actief = false;
+  try {
+    const data = await vraag("/api/sorteren");
+    if (data.error) { $("sorteer-melding").textContent = data.error; return; }
+    const ronde = data.ronde || {};
+    const t = data.tellingen || {};
+    actief = !!ronde.actief;
+
+    const p = data.provider;
+    $("ai-provider").textContent = p && p.id
+      ? `AI-provider: ${p.naam || p.id} (${p.uitleg})`
+      : `AI-provider: geen — ${p ? p.uitleg : "onbekend"}`;
+    $("sorteer-melding").textContent = ronde.melding || "Nog geen ronde gedraaid.";
+    $("sorteer-melding").className = "melding";
+
+    const bezig = data.bezig;
+    $("sorteer-bezig").hidden = !bezig;
+    $("sorteer-bezig").textContent = bezig ? `Nu: ${bezig.naam || bezig.recipe_id} (${bezig.wat})` : "";
+
+    $("knop-proefdraai").disabled = actief;
+    $("knop-uitvoeren").disabled = actief || !t.voorstel;
+    $("knop-uitvoeren").textContent = t.voorstel ? `Uitvoeren (${t.voorstel})` : "Uitvoeren";
+    $("knop-stop").hidden = !actief;
+
+    sorteerknoppen(t);
+    const lijst = $("sorteer-lijst");
+    lijst.innerHTML = "";
+    const items = await vraag("/api/sorteren/items?status=" + sorteerfilter);
+    if (items.error || !(items.items || []).length) {
+      lijst.appendChild(el("li", "leeg", items.error || "Niets met deze status."));
+    } else {
+      for (const item of items.items) lijst.appendChild(sorteerregel(item));
+    }
+  } finally {
+    // Alleen zolang het tabblad open is; daarbuiten kost het niets.
+    clearTimeout(sorteertimer);
+    if (!$("paneel-sorteren").hidden) {
+      sorteertimer = setTimeout(ververSorteren, actief ? 3000 : 15000);
+    }
+  }
+}
+
+async function sorteerknop(pad, vraagEerst) {
+  if (vraagEerst && typeof confirm === "function" && !confirm(vraagEerst)) return;
+  const data = await vraag(pad, { method: "POST" });
+  // Alleen een fout: hoe het verder gaat, staat in de regel erboven, en een
+  // "gestart" dat blijft staan als de ronde allang klaar is, zet je op het
+  // verkeerde been.
+  melding("sorteer-knopmelding", data.error || "", true);
+  ververSorteren();
+}
+
 // ---------------------------------------------------------------- opstart
+
+$("tab-importeren").addEventListener("click", () => toonTab("importeren"));
+$("tab-sorteren").addEventListener("click", () => toonTab("sorteren"));
+$("knop-proefdraai").addEventListener("click", () => sorteerknop("/api/sorteren/proefdraai"));
+$("knop-uitvoeren").addEventListener("click", () => sorteerknop("/api/sorteren/uitvoeren",
+  "Heb je een back-up van de Tandoor-database? Dit schrijft de voorstellen in je recepten."));
+$("knop-stop").addEventListener("click", () => sorteerknop("/api/sorteren/stop"));
 
 $("bekijk").addEventListener("click", bekijk);
 $("importeer").addEventListener("click", importeer);

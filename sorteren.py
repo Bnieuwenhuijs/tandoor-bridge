@@ -295,6 +295,20 @@ def maak_plan(origineel: dict, ai_antwoord: dict) -> dict:
     return {"stappen": plan, "notities": notities, "momentopname": momentopname(origineel)}
 
 
+def verandert_iets(origineel: dict, plan: dict) -> bool:
+    """
+    Zou dit plan iets aan het recept veranderen?
+
+    Een recept met één stap waar de AI niets aan splitst, blijft precies
+    zoals het was. Dat hoort geen voorstel te zijn: uitvoeren zou alleen
+    dezelfde stappen nog eens wegschrijven.
+    """
+    nu = [(s.get("id"), s.get("instruction") or "", [i.get("id") for i in _ingredienten(s)])
+          for s in _stappen(origineel)]
+    straks = [(s["id"], s["instruction"] or "", s["ingredienten"]) for s in plan["stappen"]]
+    return nu != straks
+
+
 def samenvatting(origineel: dict, plan: dict) -> dict:
     """Wat de proefdraai laat zien: stappen voor en na, en wat waarheen gaat."""
     orig_ingr = {i.get("id"): i for s in _stappen(origineel) for i in _ingredienten(s)}
