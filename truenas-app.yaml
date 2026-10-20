@@ -58,8 +58,9 @@ services:
       IMPORT_DELAY_SECONDS: "5"
       DATA_DIR: "/data"
       SEND_PROPERTIES: "false"
-      # Verwijst naar de tweede container hieronder. Leeg laten = geen browser,
-      # en dan lukt Albert Heijn niet.
+      # Verwijst naar de tweede container hieronder, voor sites die hun recept
+      # pas met JavaScript opbouwen. Leeg laten = geen browser. Albert Heijn
+      # heeft hem niet nodig: dat gaat via de app-API.
       RENDERER_URL: "http://tandoor-bridge-renderer:8096"
       LOG_LEVEL: "INFO"
 

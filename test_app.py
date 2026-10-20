@@ -188,6 +188,7 @@ def test_status(brug):
     assert data["counts"] == {"wachtend": 1}
     assert data["worker"] is False      # in de tests draait hij niet mee
     assert data["tandoor"].startswith("http")
+    assert data["ah_api"] is True
 
 
 def test_check_bevestigt_de_verbinding(brug):
@@ -351,7 +352,9 @@ def test_ah_laat_zien_wat_de_app_api_geeft(brug, monkeypatch):
     assert data["bereidingstijd"] == "PT20M"
     # De hele regel met eenheid: dat is wat Tandoor straks ontleedt.
     assert data["ingredienten"][0] == "600 g kipfilet"
-    assert len(data["stappen"]) == 3
+    # Drie stappen, en de tip als vierde.
+    assert len(data["stappen"]) == 4
+    assert data["stappen"][-1].startswith("Tip: ")
 
 
 def test_ah_meldt_netjes_dat_ah_niet_antwoordt(brug, monkeypatch):
@@ -465,3 +468,26 @@ def test_bookmarklet_met_een_pagina_zonder_recept(brug):
     pagina = antwoord.get_data(as_text=True)
     assert "Niet gelukt" in pagina
     assert "geen recept-schema" in pagina
+
+
+def test_ah_zegt_het_als_de_route_uitstaat(brug, monkeypatch):
+    import ah_api
+
+    http, _, _ = brug
+    monkeypatch.setattr(ah_api, "AH_API_AAN", False)
+    data = http.get("/api/ah?url=https://www.ah.nl/allerhande/recept/R-R1/x").get_json()
+    assert data["ok"] is False and "AH_API=0" in data["reden"]
+    assert http.get("/api/status").get_json()["ah_api"] is False
+
+
+def test_ah_geeft_bij_een_onverwachte_fout_toch_een_antwoord(brug, monkeypatch):
+    # Dit is de knop waarmee je uitzoekt wat er misgaat; een kale 500 zegt dan
+    # niets.
+    import ah_api
+
+    http, _, _ = brug
+    monkeypatch.setattr(ah_api, "fetch_recipe", lambda *a, **k: {"title": None, "ingredients": 5})
+    monkeypatch.setattr(ah_api, "to_jsonld", lambda *a, **k: 1 / 0)
+    antwoord = http.get("/api/ah?url=https://www.ah.nl/allerhande/recept/R-R1/x")
+    assert antwoord.status_code == 200
+    assert "ZeroDivisionError" in antwoord.get_json()["reden"]

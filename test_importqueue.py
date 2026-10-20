@@ -177,8 +177,16 @@ def test_een_ah_recept_gaat_via_de_api_naar_tandoor(store, client, tandoor, monk
     from conftest import MockServer
     from fetcher import fetch_page
 
+    import fetcher
+
     ah = MockServer(mock_ah.create_app())
     monkeypatch.setattr(ah_api, "API_URL", ah.url)
+    # De andere pogingen zouden www.ah.nl echt benaderen. Gaat de AH-route
+    # hier mis, dan moet de test dat zeggen - niet stilletjes een 403 van
+    # Akamai ophalen en de schuld bij Albert Heijn leggen.
+    for poging in ("_attempt_requests", "_attempt_curl", "_attempt_renderer"):
+        monkeypatch.setattr(fetcher, poging, lambda *a, _p=poging, **k: pytest.fail(
+            f"{_p} draaide: de AH-route is niet gelukt"))
     ah_api.reset_token()
     ah_api.reset_schema()
     url = "https://www.ah.nl/allerhande/recept/R-R1194169/traybake-met-kip"

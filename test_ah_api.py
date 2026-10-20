@@ -12,6 +12,7 @@ import pytest
 
 import ah_api
 import mock_ah
+import mock_tandoor
 from conftest import MockServer
 
 
@@ -109,11 +110,22 @@ def test_recept_ophalen(ah):
     assert len([r for r in gezien(ah) if r[0] == "graphql"]) == 1
 
 
-def test_een_verlopen_token_wordt_vernieuwd(ah):
+@pytest.mark.parametrize("weigering_als_graphql", [False, True],
+                         ids=["kale-401", "graphql-401"])
+def test_een_verlopen_token_wordt_vernieuwd(weigering_als_graphql):
     # Zo ziet het eruit als het token onderweg verloopt: AH antwoordt met 401.
+    # In beide vormen: {"message": ...}, en de gewone GraphQL-vorm met
+    # {"errors": [...]} - die laatste mag niet als uitleg over de vraag gelezen
+    # worden, anders komt er nooit een nieuw token.
+    server = ah_server(weigering_als_graphql=weigering_als_graphql)
     ah_api._token = ah_api._Token("van-gisteren", time.time() + 3600)
-    recept = ah_api.fetch_recipe(1194169, api_url=ah.url)
+    try:
+        recept = ah_api.fetch_recipe(1194169, api_url=server.url)
+        tokens = [r for r in gezien(server) if r[0] == "token"]
+    finally:
+        server.stop()
     assert recept["title"].startswith("Traybake")
+    assert len(tokens) == 1          # het oude zat in de cache; één nieuw gehaald
 
 
 def test_onbekend_recept(ah):
@@ -167,12 +179,55 @@ def test_de_andere_foutvormen_worden_ook_begrepen(oude_foutvorm, fout_status):
     assert "image" not in jsonld(html)
 
 
-def test_een_echte_fout_blijft_een_fout_ook_met_status_400():
-    # Geen "errors" in het antwoord: dan is 400 gewoon een 400.
-    server = ah_server(recept={"id": 1194169, "title": "x"})
+class _Antwoord:
+    """Net genoeg van een requests-antwoord voor _post()."""
+
+    def __init__(self, status, body):
+        self.status_code, self._body = status, body
+
+    def json(self):
+        if isinstance(self._body, Exception):
+            raise self._body
+        return self._body
+
+
+class _Sessie:
+    def __init__(self, antwoord):
+        self.antwoord = antwoord
+
+    def post(self, *args, **kwargs):
+        return self.antwoord
+
+
+@pytest.mark.parametrize("status, body", [
+    (400, {"message": "bad request"}),     # 400 zonder uitleg in "errors"
+    (400, ValueError("geen json")),        # 400 met een HTML-foutpagina
+    (500, {"errors": [{"message": "x"}]}),  # alleen 400 draagt een vraag-uitleg
+    (401, {"errors": [{"message": "Unauthorized"}]}),
+])
+def test_een_echte_fout_houdt_zijn_status(status, body):
+    with pytest.raises(ah_api.AhError) as fout:
+        ah_api._post("/graphql", {}, api_url="http://x", session=_Sessie(_Antwoord(status, body)),
+                     fouten_in_body=True)
+    assert fout.value.status == status
+
+
+def test_een_afgewezen_vraag_met_400_komt_als_uitleg_terug():
+    body = {"errors": [{"message": "Field 'x' in type 'Recipe' is undefined"}]}
+    assert ah_api._post("/graphql", {}, api_url="http://x",
+                        session=_Sessie(_Antwoord(400, body)), fouten_in_body=True) == body
+
+
+def test_een_onbekend_recept_zegt_dat_ook(ah):
+    with pytest.raises(ah_api.AhError, match="kent recept 42 niet"):
+        ah_api.fetch_recipe(42, api_url=ah.url)
+
+
+def test_een_leeg_antwoord_is_niet_hetzelfde_als_een_onbekend_recept():
+    server = ah_server(leeg_antwoord=True)
     try:
-        with pytest.raises(ah_api.AhError):
-            ah_api.fetch_recipe(42, api_url=server.url)
+        with pytest.raises(ah_api.AhError, match="leeg antwoord"):
+            ah_api.fetch_recipe(1194169, api_url=server.url)
     finally:
         server.stop()
 
@@ -186,11 +241,25 @@ def test_zonder_ingredientregel_bouwen_we_er_zelf_een():
     finally:
         server.stop()
     regels = jsonld(html)["recipeIngredient"]
-    # Geen eenheid - die geeft de API niet - maar wel het getal en de naam,
-    # en het meervoud zodra het er meer dan een is.
-    assert regels[0] == "600 kipfilet"
-    assert regels[1] == "2 rode paprika's"
-    assert regels[3] == "400 zwarte bonen"
+    # Het gaat om wat Tandoor ervan maakt, niet om de tekst: de mock ontleedt
+    # met dezelfde regel als Tandoor (het tweede van drie woorden wordt de
+    # eenheid). Er mag dus nooit een eenheid uit een naam ontstaan.
+    tandoor = [mock_tandoor._ingredient(regel) for regel in regels]
+    assert all(i["unit"] is None for i in tandoor), [i["unit"] for i in tandoor]
+    # Een naam van één woord houdt z'n getal.
+    assert (tandoor[0]["amount"], tandoor[0]["food"]["name"]) == (600.0, "kipfilet")
+    # Bij meer woorden blijft de naam heel en gaat het getal in de notitie -
+    # met het meervoud zodra het er meer dan één is.
+    assert (tandoor[1]["food"]["name"], tandoor[1]["note"]) == ("rode paprika's", "2")
+    assert (tandoor[3]["food"]["name"], tandoor[3]["note"]) == ("zwarte bonen", "400")
+
+
+def test_bij_een_hoeveelheid_van_een_blijft_het_enkelvoud():
+    regel = ah_api._ingredient_regel(
+        {"quantity": 1, "name": {"singular": "rode paprika", "plural": "rode paprika's"}})
+    assert regel == "rode paprika (1)"
+    assert ah_api._ingredient_regel(
+        {"quantity": None, "name": {"singular": "zout", "plural": None}}) == "zout"
 
 
 def test_een_weigering_die_niet_over_velden_gaat_blijft_een_fout():
@@ -202,6 +271,95 @@ def test_een_weigering_die_niet_over_velden_gaat_blijft_een_fout():
             ah_api.fetch_recipe(1194169, api_url=server.url)
     finally:
         server.stop()
+
+
+def _schema_zonder(**weg):
+    """Een kopie van het mockschema met per type de velden die er niet zijn."""
+    schema = {naam: dict(velden) for naam, velden in mock_ah.SCHEMA.items()}
+    for typenaam, velden in weg.items():
+        for veld in velden:
+            schema[typenaam].pop(veld)
+    return schema
+
+
+@pytest.mark.parametrize("weg, kapot, heel", [
+    # `type` zit in servings én in tips. Een onbekende tips.type mag servings
+    # niet raken, en andersom. Het pad in de foutmelding zegt welke het is.
+    ({"Tip": ["type"]}, "tips", "servings"),
+    ({"Servings": ["type"]}, "servings", "tips"),
+])
+def test_een_gedeeld_subveld_raakt_alleen_zijn_eigen_selectie(weg, kapot, heel):
+    server = ah_server(schema=_schema_zonder(**weg))
+    try:
+        html, _ = ah_api.fetch_page_html(URL, api_url=server.url)
+    finally:
+        server.stop()
+    data = jsonld(html)
+    if heel == "servings":
+        assert data["recipeYield"] == "4 personen"
+    else:
+        assert data["recipeInstructions"][-1]["text"].startswith("Tip: ")
+    assert ah_api._stand[heel] == 0
+
+
+def test_een_suggestie_in_de_foutmelding_is_geen_onbekend_veld():
+    # graphql-js zet er "Did you mean ..." achter, met velden die wél bestaan.
+    # Die mogen er niet uit vallen.
+    server = ah_server(schema=_schema_zonder(Preparation=["summary"]),
+                       oude_foutvorm=True, suggesties=True)
+    try:
+        html, _ = ah_api.fetch_page_html(URL, api_url=server.url)
+    finally:
+        server.stop()
+    data = jsonld(html)
+    assert "één plaat" in data["description"]
+    assert len(data["recipeInstructions"]) == 4
+
+
+def test_een_half_antwoord_levert_toch_het_recept():
+    # Een veld dat niet laadde (een resolver die faalde) staat in "errors",
+    # naast een recept dat verder compleet is.
+    server = ah_server(half_antwoord=True)
+    try:
+        recept = ah_api.fetch_recipe(1194169, api_url=server.url)
+    finally:
+        server.stop()
+    assert recept["ingredients"][0]["text"] == "600 g kipfilet"
+
+
+def test_een_uitgezochte_vraag_wordt_na_een_dag_opnieuw_geprobeerd(monkeypatch):
+    server = ah_server(schema=_schema_zonder(Recipe=["images"]))
+    try:
+        ah_api.fetch_recipe(1194169, api_url=server.url)
+        assert ah_api._stand["images"] == len(ah_api._SELECTIES[5].vormen)
+        rondes = len([r for r in gezien(server) if r[0] == "graphql"])
+        # Binnen de dag: meteen de uitgezochte vraag, in één ronde.
+        ah_api.fetch_recipe(1194169, api_url=server.url)
+        assert len([r for r in gezien(server) if r[0] == "graphql"]) == rondes + 1
+        # Een dag later: weer van de rijkste vraag af, dus images wordt opnieuw
+        # gevraagd.
+        monkeypatch.setattr(ah_api, "_stand_sinds", time.time() - ah_api.SCHEMA_GELDIG - 1)
+        ah_api.fetch_recipe(1194169, api_url=server.url)
+        vragen = [r[1] for r in gezien(server) if r[0] == "graphql"]
+    finally:
+        server.stop()
+    assert "images" in vragen[rondes + 1]
+
+
+@pytest.mark.parametrize("errors", [
+    "boom", {"message": "boom"}, [None, 3, "boom"], 42, None,
+])
+def test_rare_errors_geven_geen_uitzondering(errors):
+    assert ah_api._onbekende_velden(errors) == []
+
+
+def test_kent_ah_width_niet_dan_wordt_het_de_hoogste_foto():
+    server = ah_server(schema=_schema_zonder(Image=["width"]))
+    try:
+        html, _ = ah_api.fetch_page_html(URL, api_url=server.url)
+    finally:
+        server.stop()
+    assert jsonld(html)["image"][0].endswith("width=1200")
 
 
 # -- de pagina -------------------------------------------------------------
@@ -229,9 +387,12 @@ def test_de_pagina_ziet_eruit_als_de_echte(ah):
     # De grootste afbeelding eerst: die wil Tandoor als foto.
     assert data["image"][0].endswith("width=1200")
     assert data["keywords"] == "hoofdgerecht, mexicaans"
-    # De tip staat onder de beschrijving en niet tussen de stappen, want dan
-    # zou de nummering verschuiven.
-    assert "Tip: Lekker met een lik zure room." in data["description"]
+    # De tip is de laatste stap, na de echte drie. Niet in de beschrijving:
+    # die knipt Tandoor af op 512 tekens en zet hij boven de 256 nog eens voor
+    # stap 1 (get_from_scraper).
+    assert len(data["recipeInstructions"]) == 4
+    assert data["recipeInstructions"][-1]["text"] == "Tip: Lekker met een lik zure room."
+    assert "Tip:" not in data["description"]
     # Entiteiten zijn opgelost en de <a> uit de beschrijving is weg.
     assert "één plaat" in data["description"] and "<a" not in data["description"]
 
@@ -283,7 +444,11 @@ def test_een_recept_zonder_bijna_alles_levert_nog_een_pagina():
     # Een code die we niet kennen laten we weg: liever geen woord dan het
     # verkeerde woord achter het getal.
     ({"number": 4, "type": "IETS_NIEUWS"}, "4"),
-    ({"number": 1.5, "type": "PORTION"}, "1,5 porties"),
+    # Tandoor leest alleen een geheel getal: "1,5 porties" werd daar 1 portie
+    # met de tekst ",5 porties". Dus afronden.
+    ({"number": 1.5, "type": "PORTION"}, "2 porties"),
+    ({"number": "2,4", "type": "PERSON"}, "2 personen"),
+    ({"number": 0.2, "type": "PERSON"}, "1 personen"),
     ({"number": None, "type": "PERSON"}, ""),
     ({}, ""),
 ])
@@ -309,3 +474,41 @@ def test_tijden(recept, verwacht):
 def test_zonder_stappen_vallen_we_terug_op_de_samenvatting():
     recept = {"preparation": {"steps": [], "summary": ["Alles in de oven."]}}
     assert ah_api._stappen(recept) == ["Alles in de oven."]
+
+
+def test_een_nul_komt_niet_via_het_json_alsnog_in_tandoor():
+    # sanitise_html() haalt een NUL uit de HTML, maar in het JSON staat hij als
+    # \u0000 en dat ziet hij niet. Tandoor pakt het JSON uit en heeft hem dan
+    # toch - en de database weigert hem.
+    html = ah_api.to_html({"id": 7, "title": "Kip\x00korma", "ingredients": [
+        {"text": "1 ui\x07"}]}, URL)
+    assert "\\u0000" not in html and "\\u0007" not in html
+    assert jsonld(html)["name"] == "Kipkorma"
+
+
+@pytest.mark.parametrize("ruw, plat", [
+    ('Lees onze <a href=x>tips</a>.<br>Bak nu', "Lees onze tips. Bak nu"),
+    ("Soep in < 10 minuten", "Soep in < 10 minuten"),
+    ("1&#189; el", "1½ el"),
+    ({"tekst": "geen tekst"}, ""),
+])
+def test_tekst(ruw, plat):
+    assert ah_api._tekst(ruw) == plat
+
+
+def test_een_losse_tekst_wordt_niet_letter_voor_letter_gelezen():
+    # Komt er een tekst waar een lijst hoort, dan is dat één stap - geen stap
+    # per letter.
+    data = ah_api.to_jsonld({"title": "x", "preparation": {"steps": "Alles in de oven."},
+                             "courses": "hoofdgerecht", "ingredients": [{"text": "1 ui"}]}, URL)
+    assert data["recipeInstructions"] == [{"@type": "HowToStep", "text": "Alles in de oven."}]
+    assert data["keywords"] == "hoofdgerecht"
+
+
+def test_een_vreemde_maat_breekt_de_omzetting_niet():
+    data = ah_api.to_jsonld({"title": "x", "cookTime": float("inf"),
+                             "servings": {"number": float("nan")},
+                             "ingredients": [{"quantity": float("inf"),
+                                              "name": {"singular": "ui"}}]}, URL)
+    assert data["recipeIngredient"] == ["ui"]
+    assert "recipeYield" not in data and "prepTime" not in data

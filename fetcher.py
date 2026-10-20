@@ -233,10 +233,25 @@ def _attempt_ah(url: str) -> _Attempt | None:
     """
     if not ah_api.AH_API_AAN or ah_api.recipe_id_from_url(url) is None:
         return None
+    # Een mislukte AH-poging krijgt nooit een status mee. fetch_page() stopt
+    # de hele rij bij een 404 of 410, en dat klopt voor een pagina die weg is,
+    # maar een 404 van api.ah.nl zegt iets over de API en niets over het
+    # recept: dan horen de andere pogingen nog gewoon te draaien.
     try:
         html, recept = ah_api.fetch_page_html(url)
     except ah_api.AhError as e:
-        return _Attempt(False, f"AH-API: {e.reason}", e.status)
+        reden = f"{e.reason} (status {e.status})" if e.status else e.reason
+        return _Attempt(False, f"AH-API: {reden}")
+    except Exception as e:  # een antwoord waar we niet op rekenden
+        # Liever een mislukte poging dan een uitzondering die de rest van de
+        # rij en /api/diagnose meeneemt.
+        log.exception("onverwachte fout in de AH-route voor %s", url)
+        return _Attempt(False, f"AH-API: onverwachte fout ({e.__class__.__name__})")
+    if not ah_api.to_jsonld(recept, url)["recipeIngredient"]:
+        # Een recept zonder ingrediënten is geen recept, maar Tandoor maakt
+        # het wel aan - en dan staat het er, en ziet de brug het bij een
+        # nieuwe poging als "bestaat al". Liever mislukt, dan zie je het.
+        return _Attempt(False, "AH-API: AH gaf het recept zonder ingrediënten")
     log.info("recept %s bij de AH-API opgehaald: %s",
              recept.get("id"), recept.get("title"))
     return _Attempt(True, status=200,

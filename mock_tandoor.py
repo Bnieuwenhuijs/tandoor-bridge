@@ -50,12 +50,8 @@ _OG_IMAGE_RE = re.compile(
     r"""<meta[^>]*property\s*=\s*["']og:image["'][^>]*content\s*=\s*["']([^"']+)["']""", re.I)
 _TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
 
-_EENHEDEN = (
-    "gram", "g", "kg", "ml", "l", "liter", "el", "tl", "eetlepel", "theelepel",
-    "stuk", "stuks", "teen", "tenen", "snuf", "snufje", "blikje", "blik", "pak",
-)
-_HOEVEELHEID_RE = re.compile(
-    r"^\s*(\d+(?:[.,]\d+)?)\s*(" + "|".join(_EENHEDEN) + r")?\b\s*(.*)$", re.I)
+# Breuken zoals Tandoors parse_amount ze leest: "1½" is anderhalf.
+_BREUKEN = {"½": 0.5, "⅓": 1 / 3, "⅔": 2 / 3, "¼": 0.25, "¾": 0.75}
 
 
 class State:
@@ -108,28 +104,65 @@ def _canonical_url(html, org_url):
     return org_url
 
 
+def _hoeveelheid(token):
+    """Het getal waar de regel mee begint, of None als het geen getal is."""
+    breuk = 0.0
+    if token and token[-1] in _BREUKEN:
+        breuk, token = _BREUKEN[token[-1]], token[:-1]
+        if not token:
+            return breuk
+    try:
+        return float(token.replace(",", ".")) + breuk
+    except ValueError:
+        return None
+
+
+def _eten(tokens):
+    """parse_food: een laatste stuk tussen haakjes is de notitie."""
+    if len(tokens) > 1 and tokens[-1].endswith(")"):
+        for i in range(len(tokens) - 1, 0, -1):
+            if tokens[i].startswith("("):
+                return " ".join(tokens[:i]), " ".join(tokens[i:])[1:-1]
+    return " ".join(tokens), ""
+
+
 def _ingredient(regel):
     """
-    Grove benadering van Tandoors ingrediëntparser; alleen de vorm telt.
+    De kern van Tandoors ingrediëntparser, cookbook/helper/ingredient_parser.py.
 
-    Twee details zijn wél letterlijk overgenomen, omdat een client er precies
-    daarop struikelt: 'order' is in het antwoord altijd null (het veld is
-    allow_null en get_from_scraper zet het nooit), en 'unit' is null zodra er
-    geen eenheid herkend wordt. Teruggepost op POST /api/recipe/ geeft die
-    order een 400.
+    Niet de hele parser, wel de regel waar een client op kan stuklopen: bij
+    drie of meer woorden wordt het tweede woord de eenheid, wat het ook is -
+    tenzij het op een komma eindigt. Er is geen lijst met bekende eenheden.
+    "400 zwarte bonen" wordt dus 400, eenheid "zwarte", ingrediënt "bonen".
+    Een grovere nabootsing met een vaste lijst eenheden liet precies dat
+    gedrag weg, en daarmee een fout in de brug die er wel was.
+
+    Ook letterlijk overgenomen, omdat een client er precies daarop struikelt:
+    'order' is in het antwoord altijd null (het veld is allow_null en
+    get_from_scraper zet het nooit), en 'unit' is null zodra er geen eenheid
+    is. Teruggepost op POST /api/recipe/ geeft die order een 400.
     """
-    match = _HOEVEELHEID_RE.match(str(regel))
-    if not match:
-        return {"amount": 0.0, "food": {"name": str(regel).strip()}, "unit": None,
-                "note": "", "order": None, "original_text": str(regel)}
-    hoeveelheid, eenheid, rest = match.groups()
+    tekst = str(regel).strip()
+    tokens = tekst.split()
+    hoeveelheid = _hoeveelheid(tokens[0]) if tokens else None
+    eenheid, notitie = None, ""
+    if hoeveelheid is None or len(tokens) == 1:
+        naam, notitie = _eten(tokens)
+        hoeveelheid = 0.0
+    elif len(tokens) == 2:
+        naam = tokens[1]
+    elif tokens[1].endswith(","):
+        naam, notitie = _eten(tokens[1:])
+    else:
+        eenheid = tokens[1]
+        naam, notitie = _eten(tokens[2:])
     return {
-        "amount": float(hoeveelheid.replace(",", ".")),
-        "food": {"name": (rest or "").strip()},
-        "unit": {"name": eenheid.lower()} if eenheid else None,
-        "note": "",
+        "amount": float(hoeveelheid),
+        "food": {"name": naam.strip()},
+        "unit": {"name": eenheid} if eenheid else None,
+        "note": notitie,
         "order": None,
-        "original_text": str(regel),
+        "original_text": tekst,
     }
 
 

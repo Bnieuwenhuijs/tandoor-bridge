@@ -10,6 +10,7 @@ zijn er ook voor Home Assistant en voor HTTP Shortcuts op Android, zodat
 import logging
 import os
 import sys
+import threading
 from pathlib import Path
 
 from flask import Flask, jsonify, render_template, request
@@ -160,6 +161,9 @@ def create_app(*, store=None, client=None, queue=None, start_worker=True,
 
     if start_worker:
         queue.start()
+        # Hier en niet in main(): gunicorn roept main() nooit aan, dus daar
+        # kwamen deze regels in de container nooit in het logboek.
+        _meld_start(client, instellingen)
 
     # ------------------------------------------------------------- helpers
 
@@ -381,11 +385,17 @@ def create_app(*, store=None, client=None, queue=None, start_worker=True,
                             "reden": "de AH-route staat uit (AH_API=0)"}), 200
         try:
             recept = ah_api.fetch_recipe(nummer)
+            schema = ah_api.to_jsonld(recept, url)
         except ah_api.AhError as e:
             return jsonify({"url": url, "ok": False, "recept_id": nummer,
                             "reden": e.reason, "status": e.status}), 200
+        except Exception as e:
+            # Dit is de knop waarmee je uitzoekt wát er misgaat; een kale 500
+            # zegt dan niets.
+            log.exception("onverwachte fout in /api/ah voor %s", url)
+            return jsonify({"url": url, "ok": False, "recept_id": nummer,
+                            "reden": f"onverwachte fout: {e.__class__.__name__}: {e}"}), 200
 
-        schema = ah_api.to_jsonld(recept, url)
         return jsonify({
             "url": url, "ok": True, "recept_id": nummer,
             "titel": schema.get("name"),
@@ -432,26 +442,39 @@ def main():
         raise SystemExit(2)
 
     app = create_app(config=instellingen)
+    app.run(host="0.0.0.0", port=instellingen["port"])
 
-    # Niet afbreken als Tandoor even niet luistert: de wachtrij blijft staan en
-    # pakt het later op. Wel meteen in het logboek, want dit is bij het
-    # inrichten de fout die je wilt zien.
-    try:
-        aantal = app.client.check_connection()
-        log.info("verbonden met Tandoor (%d recepten)", aantal)
-    except TandoorError as e:
-        log.warning("Tandoor antwoordt nog niet: %s", e.message)
 
+def _meld_start(client, instellingen: dict) -> None:
+    """Zet in het logboek hoe de brug is ingericht, voor wie de logs leest."""
+    import ah_api
     from fetcher import RENDERER_URL
 
+    log.info("brug draait op poort %s, pauze van %ss tussen imports",
+             instellingen["port"], instellingen["delay"])
+    if ah_api.AH_API_AAN:
+        log.info("Albert Heijn gaat via de app-API (%s)", ah_api.API_URL)
+    else:
+        log.info("de AH-route staat uit (AH_API=0); AH-recepten kunnen dan "
+                 "alleen via de bookmarklet")
     if RENDERER_URL:
         log.info("browser-container ingesteld op %s", RENDERER_URL)
     else:
-        log.info("geen browser-container (RENDERER_URL is leeg); sites die elke "
-                 "server-side aanvraag weigeren, zoals Albert Heijn, lukken niet")
-    log.info("brug draait op poort %s, pauze van %ss tussen imports",
-             instellingen["port"], instellingen["delay"])
-    app.run(host="0.0.0.0", port=instellingen["port"])
+        log.info("geen browser-container (RENDERER_URL is leeg); sites die hun "
+                 "recept pas met JavaScript opbouwen lukken dan niet")
+
+    # In een eigen thread: een Tandoor die niet antwoordt mag de start niet
+    # ophouden - de wachtrij wacht wel. Maar het hoort wel meteen in het
+    # logboek, want dit is bij het inrichten de fout die je wilt zien.
+    def controleer():
+        try:
+            log.info("verbonden met Tandoor (%d recepten)", client.check_connection())
+        except TandoorError as e:
+            log.warning("Tandoor antwoordt nog niet: %s", e.message)
+        except Exception:
+            log.exception("verbinding met Tandoor niet te controleren")
+
+    threading.Thread(target=controleer, name="startcontrole", daemon=True).start()
 
 
 if __name__ == "__main__":

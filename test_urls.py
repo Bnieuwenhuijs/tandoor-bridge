@@ -75,8 +75,10 @@ def test_ah_korte_link_wordt_herschreven():
     assert normalize_url("https://www.ah.nl/r/1197620") == (
         "https://www.ah.nl/allerhande/recept/R-R1197620"
     )
+    # Zonder www wordt het mét: dit wordt de source_url, en Tandoor vergelijkt
+    # die letterlijk met wat er al staat.
     assert normalize_url("https://ah.nl/r/1197620/") == (
-        "https://ah.nl/allerhande/recept/R-R1197620"
+        "https://www.ah.nl/allerhande/recept/R-R1197620"
     )
     assert normalize_url("https://www.ah.nl/r/1197620?at_medium=app") == (
         "https://www.ah.nl/allerhande/recept/R-R1197620"

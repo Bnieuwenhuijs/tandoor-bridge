@@ -69,8 +69,8 @@ def ah_only(url: str):
     try:
         recept = ah_api.fetch_recipe(nummer)
     except ah_api.AhError as e:
-        afbreken(e.reason, "zet AH_API=0 om deze route uit te zetten; de "
-                           "bookmarklet en de browser-container blijven dan over")
+        afbreken(e.reason, "zet AH_API=0 om deze route uit te zetten; voor AH "
+                           "blijft dan de bookmarklet over")
     print(f"{GOED} {recept.get('title')}")
     print(f"{INFO} velden die AH gaf: {', '.join(sorted(recept.keys()))}")
 

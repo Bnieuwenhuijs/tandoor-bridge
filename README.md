@@ -185,7 +185,9 @@ curl -X POST http://192.168.1.130:8095/api/import \
 | `GET /api/items?status=mislukt` | de geschiedenis |
 | `POST /api/items/<id>/retry` | één item opnieuw |
 | `POST /api/retry-failed` | alle mislukte opnieuw |
-| `GET /api/status` | tellers en of de worker draait |
+| `GET /api/status` | tellers, of de worker draait, of de AH-route aanstaat |
+| `GET /api/diagnose?url=...` | probeert één pagina op alle manieren, zonder Tandoor |
+| `POST /bookmarklet` | waar de bookmarklet een pagina heen stuurt (formulier: `url`, `html`) |
 | `GET /api/check` | werkt de verbinding met Tandoor |
 | `GET /api/ah?url=...` | wat de AH-app-API van dit recept geeft, zonder Tandoor |
 | `GET /healthz` | voor de healthcheck van Docker |
@@ -328,9 +330,10 @@ blik` van maakt. Food Alias, Unit Alias, Never Unit en Food Replace doen
 daarna hun werk, net als bij elk ander recept. De brug ontleedt zelf niets.
 
 Wat er meekomt: titel, beschrijving, porties, bereidingstijd, de
-ingrediëntregels, de stappen, de foto in de grootste maat, en de tips (die
-komen onder de beschrijving te staan, niet tussen de stappen, want dan zou de
-nummering verschuiven). Het domein-trefwoord `www.ah.nl` komt er via de
+ingrediëntregels, de stappen, de foto in de grootste maat, en de tips. Die
+laatste komen als extra stap(pen) ná de echte, met `Tip:` ervoor. Niet in de
+beschrijving: die knipt Tandoor af op 512 tekens, en boven de 256 zet hij hem
+ook nog eens voor stap 1, zodat je hem twee keer leest. Het domein-trefwoord `www.ah.nl` komt er via de
 canonical in, dus Food Replace-regels met een bron-regex vuren ook.
 
 Werkt het? Kijk zonder Tandoor erbij:
@@ -351,8 +354,11 @@ Je ziet dan welke ingrediëntregels Tandoor straks te ontleden krijgt.
 veldnamen komen uit openbare clients die dezelfde API gebruiken. Daarom vraagt
 de brug alles buiten de kern *optioneel*: zegt AH over een veld "is
 undefined", dan laat hij dat veld vallen (of vraagt een kalere vorm) en
-probeert het opnieuw. Welke vraag werkte blijft daarna in het geheugen staan,
-dus dat kost één keer een extra ronde en niet bij elk recept. Verandert AH
+probeert het opnieuw. Welke vraag werkte blijft daarna een dag in het
+geheugen staan, dus dat kost één keer een extra ronde en niet bij elk recept.
+Na die dag begint hij weer bij de volledige vraag: zo blijft een veld dat AH
+één keer niet kende niet wekenlang weg, en komt een veld dat AH erbij zet er
+vanzelf bij. Verandert AH
 morgen iets, dan levert de brug een kaler recept in plaats van een foutmelding
 — en staat in het logboek welk veld verdwenen is:
 
@@ -360,8 +366,9 @@ morgen iets, dan levert de brug een kaler recept in plaats van een foutmelding
 AH kent images niet (meer); vraag aangepast
 ```
 
-Zet AH de API helemaal dicht, dan zet je `AH_API=0`; de browser-container en
-de bookmarklet blijven over. Weigert AH ons omdat de app-versie te oud is, zet
+Zet AH de API helemaal dicht, dan zet je `AH_API=0`; dan blijft voor AH
+alleen de bookmarklet over. De browser-container helpt daar niet: die krijgt
+bij `www.ah.nl` ook een 403 (zie hieronder). Weigert AH ons omdat de app-versie te oud is, zet
 dan `AH_CLIENT_VERSION` (en eventueel `AH_USER_AGENT`) op de versie die nu in
 de App Store staat. Dat kan zonder nieuwe image.
 
@@ -393,7 +400,8 @@ zonder werk. Tijdens een import is het kortdurend een paar honderd MB.
 Heb je hem niet nodig, haal dan de service en `RENDERER_URL` weg. De brug
 werkt dan gewoon door met de overige pogingen en zegt bij de start:
 `geen browser-container (RENDERER_URL is leeg)`. AH blijft werken: dat gaat
-via de app-API.
+via de app-API, en de startregel daarvoor is `Albert Heijn gaat via de
+app-API`.
 
 > Zet die container **niet** open naar buiten en geef hem geen `ports`. Hij
 > haalt elke URL op die je hem geeft, dus binnen het Docker-netwerk is de
@@ -461,8 +469,10 @@ Twee dingen die eraan vastzitten:
   via het adres dat je ook onderweg gebruikt - via Tailscale werkt hij dan ook
   buiten huis.
 
-Eén klik per recept, dus geen lijst van 233. Voor die lijst geldt: alles wat
-geen AH is loopt gewoon automatisch door de wachtrij.
+Eén klik per recept, dus niet voor een lijst van 233 - maar dat hoeft ook
+niet meer: AH-recepten lopen via de app-API gewoon automatisch door de
+wachtrij. De bookmarklet is er voor de sites die de NAS helemaal weigeren, en
+als uitwijk voor AH als je `AH_API=0` hebt moeten zetten.
 
 ## De rooktest
 
@@ -513,9 +523,11 @@ verder dan de `tda_`-prefix, en de AI-endpoints.
 
 - Geen eigen ingrediëntenparser, geen categorieën, geen Bring. Ook op de
   AH-route niet: daar gaat de hele ingrediëntregel zoals AH hem geeft naar
-  Tandoor, die hem ontleedt. Alleen als AH die regel ooit niet meegeeft, zet
-  de brug er zelf getal en naam achter elkaar — zonder eenheid, want die
-  verzint hij niet.
+  Tandoor, die hem ontleedt. Alleen als AH die regel ooit niet meegeeft,
+  maakt de brug er zelf een van getal en naam, en dan zo dat Tandoor er geen
+  eenheid uit kan halen: bij een naam van meer woorden zou Tandoor het tweede
+  woord als eenheid lezen (`400 zwarte bonen` → eenheid `zwarte`), dus komt het
+  getal dan tussen haakjes achter de naam en in de notitie.
 - Niets wijzigen aan bestaande recepten in Tandoor. Alleen `source_url` en de
   foto van recepten die hij zelf net heeft aangemaakt.
 - Niets verwijderen.

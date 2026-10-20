@@ -92,6 +92,12 @@ def test_de_dockerfile_kopieert_alles_wat_er_geimporteerd_wordt(
     )
 
 
+def test_de_brug_kopieert_ook_de_templates():
+    # Een vergeten templates/ start wél op en geeft /healthz netjes terug - de
+    # CI-controle ziet er dus niets van - maar de startpagina is een 500.
+    assert any(bron.rstrip("/") == "templates" for bron in _gekopieerd(HIER / "Dockerfile"))
+
+
 def test_de_test_zou_een_vergeten_copy_ook_echt_zien():
     """
     Een controle op de controle: zonder deze test zou de bovenstaande stil

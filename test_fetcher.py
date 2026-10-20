@@ -396,3 +396,67 @@ def test_diagnose_zonder_browser_container():
     uit = renderer_diagnose("")
     assert uit["ingesteld"] is False
     assert "RENDERER_URL is leeg" in uit["reden"]
+
+
+# -- de AH-route in de rij ------------------------------------------------------
+
+AH_LINK = "https://www.ah.nl/allerhande/recept/R-R1194169/traybake"
+
+
+def _pagina_via_headers(monkeypatch):
+    """Laat de headerpoging slagen, zodat te zien is óf de rij doorloopt."""
+    import fetcher
+
+    gezien = []
+
+    def nep(url, *, timeout, headers=None, naam="requests"):
+        gezien.append(naam)
+        return _Attempt(True, status=200,
+                        result=fetcher.FetchResult(url, url, 200, MET_SCHEMA, naam))
+
+    monkeypatch.setattr(fetcher, "_attempt_requests", nep)
+    monkeypatch.setattr(fetcher, "_attempt_curl", lambda url, *, timeout: None)
+    return gezien
+
+
+@pytest.mark.parametrize("fout", [
+    # Een 404 van api.ah.nl zegt iets over de API, niet over het recept.
+    "ah-404",
+    # Een antwoord waar de code niet op rekende.
+    "onverwacht",
+    # Een recept zonder ingrediënten: Tandoor zou het aanmaken, en dan staat het
+    # er en ziet de brug het bij een nieuwe poging als "bestaat al".
+    "zonder-ingredienten",
+])
+def test_een_mislukte_ah_poging_laat_de_rest_van_de_rij_draaien(monkeypatch, fout):
+    import ah_api
+    import fetcher
+
+    def nep_ah(url, **_):
+        if fout == "ah-404":
+            raise ah_api.AhError("AH gaf status 404", status=404)
+        if fout == "onverwacht":
+            raise KeyError("recipe")
+        return "<html></html>", {"id": 1, "title": "Kaal"}
+
+    monkeypatch.setattr(ah_api, "fetch_page_html", nep_ah)
+    gezien = _pagina_via_headers(monkeypatch)
+
+    pagina = fetch_page(AH_LINK, renderer_url="")
+    assert pagina.via == "requests"
+    assert gezien == ["requests"]
+
+
+def test_met_de_ah_route_uit_wordt_hij_ook_niet_geprobeerd(monkeypatch):
+    import ah_api
+    import fetcher
+
+    monkeypatch.setattr(ah_api, "AH_API_AAN", False)
+    monkeypatch.setattr(ah_api, "fetch_page_html",
+                        lambda *a, **k: pytest.fail("de AH-route staat uit"))
+    _pagina_via_headers(monkeypatch)
+    assert fetch_page(AH_LINK, renderer_url="").via == "requests"
+
+    monkeypatch.setattr(fetcher, "RENDERER_URL", "")
+    [ah] = [p for p in fetcher.probe(AH_LINK) if p["poging"] == "AH-API"]
+    assert ah["ok"] is False and "AH_API=0" in ah["reden"]

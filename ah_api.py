@@ -47,10 +47,10 @@ API_URL = os.environ.get("AH_API_URL", "https://api.ah.nl").strip().rstrip("/")
 # ook via de omgeving, zonder nieuwe image.
 CLIENT_ID = os.environ.get("AH_CLIENT_ID", "appie-ios").strip() or "appie-ios"
 CLIENT_VERSION = os.environ.get("AH_CLIENT_VERSION", "9.28").strip() or "9.28"
-USER_AGENT = os.environ.get(
-    "AH_USER_AGENT",
-    f"Appie/{CLIENT_VERSION} (iPhone17,3; iPhone; CPU OS 26_1 like Mac OS X)",
-)
+# Een lege AH_USER_AGENT= in de .env (zoals example.env hem laat staan) is
+# "niet ingesteld", geen lege kop.
+USER_AGENT = (os.environ.get("AH_USER_AGENT", "").strip()
+              or f"Appie/{CLIENT_VERSION} (iPhone17,3; iPhone; CPU OS 26_1 like Mac OS X)")
 
 TIMEOUT = 20
 
@@ -131,19 +131,26 @@ def _post(pad: str, body: dict, *, api_url: str, session, bearer: str | None = N
     "errors" - niet met 200 zoals de meeste GraphQL-servers. Zonder deze
     uitzondering zouden we die uitleg weggooien en nooit zien welk veld hij
     niet kent.
+
+    Alleen bij 400. Een 401 of 403 met "errors" erin (de gewone vorm van een
+    GraphQL-gateway die een token weigert) gaat de vraag niet aan maar het
+    token, en moet z'n status houden: daar hangt de nieuwe-tokenpoging in
+    fetch_recipe() aan.
     """
     try:
         antwoord = session.post(f"{api_url}{pad}", json=body,
                                 headers=_headers(bearer), timeout=TIMEOUT)
     except requests.RequestException as e:
         raise AhError(f"AH niet bereikbaar: {e.__class__.__name__}") from e
-    inhoud = None
     try:
         inhoud = antwoord.json()
-    except ValueError:
+    except (ValueError, requests.RequestException):
+        # RequestException hier is een body die niet uit te pakken valt
+        # (ContentDecodingError); dat leest pas bij .json(), niet bij post().
         inhoud = None
     if antwoord.status_code >= 400:
-        if fouten_in_body and isinstance(inhoud, dict) and inhoud.get("errors"):
+        if (fouten_in_body and antwoord.status_code == 400
+                and isinstance(inhoud, dict) and inhoud.get("errors")):
             return inhoud
         raise AhError(f"AH gaf status {antwoord.status_code}", status=antwoord.status_code)
     if not isinstance(inhoud, dict):
@@ -168,7 +175,10 @@ def token(*, api_url: str | None = None, session=None) -> str:
         waarde = antwoord.get("access_token")
         if not waarde:
             raise AhError("AH gaf geen token terug")
-        leeft = int(antwoord.get("expires_in") or 3600)
+        try:
+            leeft = int(antwoord.get("expires_in") or 3600)
+        except (TypeError, ValueError):
+            leeft = 3600                    # liever te kort dan een vastloper
         _token = _Token(str(waarde), time.time() + max(leeft - TOKEN_MARGE, 30))
         log.info("anoniem AH-token gehaald, geldig voor %d seconden", leeft)
         return _token.waarde
@@ -210,7 +220,10 @@ _SELECTIES = (
     _Selectie("cookTime", ("cookTime",)),
     _Selectie("servings", ("servings { number type }", "servings { number }"),
               frozenset({"number", "type"})),
-    _Selectie("images", ("images { url width height rendition }",
+    # Kent AH width niet, dan liever height dan alleen url: zonder maat is
+    # niet te zien welke de grote is, en dan wordt het de eerste - bij AH het
+    # kleinste plaatje.
+    _Selectie("images", ("images { url width height rendition }", "images { url height }",
                          "images { url width }", "images { url }"),
               frozenset({"url", "width", "height", "rendition"})),
     _Selectie("courses", ("courses",)),
@@ -226,27 +239,47 @@ _QUERY = """query Recept($id: Int!) {
 
 # graphql-java schrijft "Field 'text' in type 'RecipeIngredient' is undefined"
 # en zet het pad in de code erachter: FieldUndefined@[recipe/ingredients/text].
-# Andere servers schrijven: Cannot query field "text" on type "RecipeIngredient".
-# We halen de namen tussen aanhalingstekens op en de laatste stap van dat pad.
-# Alleen de laatste: de rest van het pad zijn de velden waar het onbekende veld
-# in zat, en die bestaan juist wél. Zouden we die meenemen, dan gooiden we
-# ingredients in z'n geheel weg omdat er één subveld niet bestaat.
-_NAAM_RE = re.compile(r"""['"]([A-Za-z_][A-Za-z0-9_]*)['"]|@\[([A-Za-z0-9_/]+)\]""")
+# Andere servers schrijven: Cannot query field "text" on type
+# "RecipeIngredient". Did you mean "steps"?
+#
+# Het pad zegt welke selectie het is: de stap na recipe. Dat is nodig, want
+# sommige subvelden staan in meer dan één selectie - `type` zit zowel in
+# servings als in tips - en zonder pad zou een onbekende tips.type ook
+# servings een vorm terugzetten, en dat voor de rest van de dag. Zonder pad
+# nemen we alleen het veld direct na "field": wat er verder tussen
+# aanhalingstekens staat is de typenaam of een suggestie, en een suggestie als
+# "description" is juist een veld dat wél bestaat.
+_PAD_RE = re.compile(r"@\[([A-Za-z0-9_/]+)\]")
+_VELD_RE = re.compile(r"""field\s+['"]([A-Za-z_][A-Za-z0-9_]*)['"]""", re.IGNORECASE)
 
 
-def _onbekende_velden(errors: list) -> set:
-    namen = set()
-    for fout in errors or []:
-        bericht = str((fout or {}).get("message", ""))
+def _berichten(errors) -> list:
+    """De foutteksten, in welke vorm AH ze ook stuurt: lijst, dict of tekst."""
+    if isinstance(errors, (str, dict)):
+        errors = [errors]
+    if not isinstance(errors, list):
+        return []
+    return [str(f.get("message", "")) if isinstance(f, dict) else str(f) for f in errors]
+
+
+def _onbekende_velden(errors) -> list:
+    """(selectie of None, veld) voor elk veld dat AH niet kent."""
+    treffers = []
+    for bericht in _berichten(errors):
         laag = bericht.lower()
         if "undefined" not in laag and "cannot query" not in laag:
             continue
-        for tussen, pad in _NAAM_RE.findall(bericht):
-            if tussen:
-                namen.add(tussen)
-            if stappen := [deel for deel in pad.split("/") if deel]:
-                namen.add(stappen[-1])
-    return namen
+        if pad := _PAD_RE.search(bericht):
+            stappen = [deel for deel in pad.group(1).split("/") if deel]
+            if len(stappen) >= 3:                 # recipe/ingredients/text
+                treffers.append((stappen[1], stappen[-1]))
+                continue
+            if len(stappen) == 2:                 # recipe/images
+                treffers.append((None, stappen[1]))
+                continue
+        if veld := _VELD_RE.search(bericht):
+            treffers.append((None, veld.group(1)))
+    return treffers
 
 
 def _bouw_query(stand: dict) -> str:
@@ -258,18 +291,24 @@ def _bouw_query(stand: dict) -> str:
     return _QUERY % "\n    ".join(stukken)
 
 
-def _pas_aan(stand: dict, namen: set) -> list:
+def _pas_aan(stand: dict, treffers: list) -> list:
     """Zet selecties een vorm terug of helemaal uit; geeft terug wat er veranderde."""
     veranderd = []
     for selectie in _SELECTIES:
         if stand[selectie.naam] >= len(selectie.vormen):
             continue
-        if selectie.naam in namen:
-            stand[selectie.naam] = len(selectie.vormen)      # het veld bestaat niet
+        for bij, veld in treffers:
+            if bij is None and veld == selectie.naam:
+                stand[selectie.naam] = len(selectie.vormen)  # het veld bestaat niet
+            elif bij == selectie.naam or (bij is None and veld in selectie.subvelden):
+                # Zonder pad weten we niet bij welke selectie een gedeeld
+                # subveld hoort, en zetten we ze allebei terug. Beter dan
+                # blijven vragen naar iets wat er niet is.
+                stand[selectie.naam] += 1                    # kalere vorm proberen
+            else:
+                continue
             veranderd.append(selectie.naam)
-        elif namen & selectie.subvelden:
-            stand[selectie.naam] += 1                        # kalere vorm proberen
-            veranderd.append(selectie.naam)
+            break                                            # één stap per ronde
     return veranderd
 
 
@@ -279,18 +318,26 @@ def _graphql(query: str, variables: dict, *, api_url: str, session, bearer: str)
                  fouten_in_body=True)
 
 
-# Welke vraag bij deze AH werkt, hoeven we maar één keer uit te zoeken. Zonder
-# deze cache kost elk recept opnieuw de rondes die nodig waren om erachter te
-# komen dat een veld niet bestaat.
+# Welke vraag bij deze AH werkt, hoeven we niet bij elk recept opnieuw uit te
+# zoeken. Zonder deze cache kost elk recept de rondes die nodig waren om
+# erachter te komen dat een veld niet bestaat.
+#
+# Maar niet voor altijd: na een dag beginnen we weer bij de rijkste vraag. Een
+# veld dat AH één keer niet kende - een storing, een halve uitrol - hoort niet
+# weken weg te blijven in een container die weken doordraait, en een veld dat
+# AH erbij zet, komt er zo vanzelf weer bij.
+SCHEMA_GELDIG = 24 * 3600
+
 _stand: dict | None = None
+_stand_sinds = 0.0
 _stand_slot = threading.Lock()
 
 
 def reset_schema() -> None:
     """Vergeet welke vraag werkte. Voor de tests."""
-    global _stand
+    global _stand, _stand_sinds
     with _stand_slot:
-        _stand = None
+        _stand, _stand_sinds = None, 0.0
 
 
 def fetch_recipe(recipe_id: int, *, api_url: str | None = None, session=None) -> dict:
@@ -298,7 +345,7 @@ def fetch_recipe(recipe_id: int, *, api_url: str | None = None, session=None) ->
     try:
         return _fetch_recipe(recipe_id, api_url=api_url, session=session)
     except AhError as e:
-        if e.status != 401:
+        if e.status not in (401, 403):
             raise
         # Het token was toch verlopen. De brug draait weken achter elkaar, dus
         # dit gebeurt een keer: nieuw token, en nog één poging.
@@ -308,32 +355,44 @@ def fetch_recipe(recipe_id: int, *, api_url: str | None = None, session=None) ->
 
 
 def _fetch_recipe(recipe_id: int, *, api_url: str | None = None, session=None) -> dict:
-    global _stand
+    global _stand, _stand_sinds
     api_url = (api_url or API_URL).rstrip("/")
     eigen = session or requests.Session()
     try:
         bearer = token(api_url=api_url, session=eigen)
         with _stand_slot:
-            stand = dict(_stand) if _stand else {s.naam: 0 for s in _SELECTIES}
+            vers = _stand and time.time() - _stand_sinds < SCHEMA_GELDIG
+            stand = dict(_stand) if vers else {s.naam: 0 for s in _SELECTIES}
         # Elke ronde valt er minstens een selectie terug of af, dus dit loopt
         # hoe dan ook af; de grens is er voor het geval AH iets zegt wat we
         # verkeerd begrijpen.
         for _ in range(sum(len(s.vormen) for s in _SELECTIES) + 2):
             antwoord = _graphql(_bouw_query(stand), {"id": int(recipe_id)},
                                 api_url=api_url, session=eigen, bearer=bearer)
-            recept = (antwoord.get("data") or {}).get("recipe")
-            fouten = antwoord.get("errors") or []
-            if recept and not fouten:
+            data = antwoord.get("data")
+            recept = data.get("recipe") if isinstance(data, dict) else None
+            fouten = antwoord.get("errors")
+            treffers = _onbekende_velden(fouten)
+            if isinstance(recept, dict) and recept and not treffers:
+                # Ook met een melding erbij: GraphQL mag een half antwoord
+                # geven (één veld dat niet laadde), en een recept zonder één
+                # veld is nog steeds het recept.
+                if fouten:
+                    log.warning("AH gaf recept %s met een melding erbij: %s", recipe_id,
+                                "; ".join(_berichten(fouten)[:3])[:300])
                 with _stand_slot:
-                    _stand = dict(stand)
+                    _stand, _stand_sinds = dict(stand), time.time()
                 return recept
             if not fouten:
-                raise AhError(f"AH kent recept {recipe_id} niet")
-            namen = _onbekende_velden(fouten)
-            if not namen or not _pas_aan(stand, namen):
-                melding = "; ".join(str(f.get("message", "")) for f in fouten[:3])
+                if isinstance(data, dict) and "recipe" in data:
+                    raise AhError(f"AH kent recept {recipe_id} niet")
+                raise AhError("AH gaf een leeg antwoord")
+            if not treffers or not _pas_aan(stand, treffers):
+                melding = "; ".join(_berichten(fouten)[:3])
                 raise AhError(f"AH weigerde de vraag: {melding[:300]}")
-            log.info("AH kent %s niet (meer); vraag aangepast", ", ".join(sorted(namen)))
+            log.info("AH kent %s niet (meer); vraag aangepast",
+                     ", ".join(sorted(f"{bij}.{veld}" if bij else veld
+                                      for bij, veld in treffers)))
         raise AhError("AH bleef de vraag weigeren")
     finally:
         if session is None:
@@ -343,6 +402,14 @@ def _fetch_recipe(recipe_id: int, *, api_url: str | None = None, session=None) -
 # -- naar een pagina ------------------------------------------------------
 
 _TAG_RE = re.compile(r"<[^>]+>")
+# NUL en de andere stuurtekens. sanitise_html() in tandoor.py haalt een NUL
+# uit de HTML, maar in het JSON-LD staat hij als \u0000 - zes gewone tekens
+# die daar niet op lijken. Tandoor pakt het JSON daarna uit en heeft de NUL
+# dan alsnog, en die weigert de database. Dus hier al weg.
+_STUUR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+# Een tag wordt een spatie, anders plakken "tips</a>.<br>Bak" aan elkaar; maar
+# dan staat er een spatie voor de punt, en die haalt niemand er later uit.
+_VOOR_LEESTEKEN_RE = re.compile(r"\s+([,.;:!?)])")
 
 # AH geeft de portiesoort als code terug. Alleen wat we kennen zetten we om;
 # een onbekende code laten we weg, want een verkeerd woord achter het getal is
@@ -354,22 +421,37 @@ _PORTIES = {
 }
 
 
+def _lijst(waarde) -> list:
+    """Een AH-veld als lijst. Een losse tekst is één element, geen rij letters."""
+    if isinstance(waarde, list):
+        return waarde
+    if isinstance(waarde, (str, dict)) and waarde:
+        return [waarde]
+    return []
+
+
+def _veld(recept: dict, naam: str) -> dict:
+    waarde = recept.get(naam)
+    return waarde if isinstance(waarde, dict) else {}
+
+
 def _tekst(waarde) -> str:
     """Een AH-veld naar platte tekst: er zitten links en entiteiten in."""
-    if not waarde:
+    if not waarde or isinstance(waarde, (dict, list)):
         return ""
-    plat = _TAG_RE.sub(" ", str(waarde))
-    return re.sub(r"\s+", " ", htmllib.unescape(plat)).strip()
+    plat = htmllib.unescape(_TAG_RE.sub(" ", str(waarde)))
+    plat = re.sub(r"\s+", " ", _STUUR_RE.sub("", plat)).strip()
+    return _VOOR_LEESTEKEN_RE.sub(r"\1", plat)
 
 
 def _getal(waarde) -> str:
     """4.0 wordt "4", 1.5 wordt "1,5" - zoals AH het op de pagina zet."""
     try:
-        getal = float(waarde)
-    except (TypeError, ValueError):
+        getal = float(str(waarde).replace(",", "."))
+        if getal == int(getal):
+            return str(int(getal))
+    except (TypeError, ValueError, OverflowError):     # ook inf en nan
         return ""
-    if getal == int(getal):
-        return str(int(getal))
     return f"{getal:g}".replace(".", ",")
 
 
@@ -377,35 +459,73 @@ def _ingredient_regel(ingredient: dict) -> str:
     regel = _tekst(ingredient.get("text"))
     if regel:
         return regel
-    # Zonder `text` zelf samenstellen. Een eenheid zit er niet bij: die geeft
-    # de API niet, en wij gaan er geen verzinnen.
-    naam = ingredient.get("name") or {}
+    # Zonder `text` zelf samenstellen, en dan oppassen: Tandoors parser maakt
+    # van het tweede woord de eenheid zodra er drie of meer zijn
+    # (cookbook/helper/ingredient_parser.py). "400 zwarte bonen" wordt dan 400,
+    # eenheid "zwarte", ingrediënt "bonen" - een verzonnen eenheid in je ruimte
+    # en een Food Alias die niet vuurt. Bij een naam van meer woorden zetten we
+    # het getal daarom tussen haakjes erachter: dan houdt Tandoor de naam heel
+    # en komt het getal in de notitie. De hoeveelheid zelf is dan weg, maar
+    # die kan je zien; een verkeerde eenheid valt pas op als het misgaat.
+    naam = _veld(ingredient, "name")
     aantal = _getal(ingredient.get("quantity"))
     enkel, meervoud = _tekst(naam.get("singular")), _tekst(naam.get("plural"))
     woord = meervoud if (meervoud and aantal not in ("", "1")) else enkel
-    return " ".join(deel for deel in (aantal, woord) if deel)
+    if not woord:
+        return ""
+    if not aantal:
+        return woord
+    if len(woord.split()) == 1:
+        return f"{aantal} {woord}"
+    return f"{woord} ({aantal})"
 
 
 def _stappen(recept: dict) -> list:
-    bereiding = recept.get("preparation") or {}
+    bereiding = _veld(recept, "preparation")
     for sleutel in ("steps", "summary"):
-        regels = [_tekst(stap) for stap in (bereiding.get(sleutel) or [])]
+        regels = [_tekst(stap) for stap in _lijst(bereiding.get(sleutel))]
         if regels := [regel for regel in regels if regel]:
             return regels
     return []
 
 
+def _tips(recept: dict) -> list:
+    tips = []
+    for tip in _lijst(recept.get("tips")):
+        tekst = _tekst(tip.get("value")) if isinstance(tip, dict) else _tekst(tip)
+        if tekst:
+            tips.append(f"Tip: {tekst}")
+    return tips
+
+
 def _afbeeldingen(recept: dict) -> list:
-    beelden = [b for b in (recept.get("images") or [])
-               if isinstance(b, dict) and b.get("url")]
-    beelden.sort(key=lambda b: b.get("width") or 0, reverse=True)
-    urls = list(dict.fromkeys(str(beeld["url"]) for beeld in beelden))
-    return urls[:4]
+    beelden = [b for b in _lijst(recept.get("images"))
+               if isinstance(b, dict) and isinstance(b.get("url"), str) and b["url"]]
+
+    def breedte(beeld):
+        # width, anders height, anders de ?width= die AH in de URL zet.
+        for maat in (beeld.get("width"), beeld.get("height"),
+                     (re.search(r"[?&]width=(\d+)", beeld["url"]) or [None, None])[1]):
+            try:
+                if maat and float(maat) > 0:
+                    return float(maat)
+            except (TypeError, ValueError):
+                continue
+        return 0.0
+
+    beelden.sort(key=breedte, reverse=True)
+    return list(dict.fromkeys(beeld["url"] for beeld in beelden))[:4]
 
 
 def _porties(recept: dict) -> str:
-    porties = recept.get("servings") or {}
-    aantal = _getal(porties.get("number"))
+    porties = _veld(recept, "servings")
+    try:
+        getal = float(str(porties.get("number")).replace(",", "."))
+        # Tandoor leest alleen het eerste gehele getal (parse_servings), dus
+        # "1,5 porties" werd 1 portie met de tekst ",5 porties". Afronden.
+        aantal = max(int(getal + 0.5), 1) if getal > 0 else 0
+    except (TypeError, ValueError, OverflowError):
+        aantal = 0
     if not aantal:
         return ""
     soort = str(porties.get("type") or "").strip()
@@ -415,8 +535,8 @@ def _porties(recept: dict) -> str:
 
 def _minuten(waarde) -> int:
     try:
-        return max(int(waarde), 0)
-    except (TypeError, ValueError):
+        return max(int(float(waarde)), 0)
+    except (TypeError, ValueError, OverflowError):
         return 0
 
 
@@ -430,20 +550,10 @@ def _tijden(recept: dict) -> tuple:
     cookTime - niet andersom, want dan staat alle tijd als wachttijd in
     Tandoor en de bereidingstijd op nul.
     """
-    tijd = recept.get("time") or {}
+    tijd = _veld(recept, "time")
     bereiden = _minuten(tijd.get("cook")) or _minuten(recept.get("cookTime"))
     wachten = _minuten(tijd.get("oven")) + _minuten(tijd.get("wait"))
     return bereiden, wachten
-
-
-def _beschrijving(recept: dict) -> str:
-    delen = [_tekst(recept.get("description"))]
-    # De tips staan op de AH-pagina naast het recept. Tussen de stappen zetten
-    # verandert de nummering, dus ze gaan onder de beschrijving.
-    for tip in recept.get("tips") or []:
-        if tekst := _tekst((tip or {}).get("value")):
-            delen.append(f"Tip: {tekst}")
-    return "\n\n".join(deel for deel in delen if deel)
 
 
 def to_jsonld(recept: dict, url: str) -> dict:
@@ -454,7 +564,7 @@ def to_jsonld(recept: dict, url: str) -> dict:
         "name": _tekst(recept.get("title")),
         "url": url,
     }
-    if beschrijving := _beschrijving(recept):
+    if beschrijving := _tekst(recept.get("description")):
         data["description"] = beschrijving
     if beelden := _afbeeldingen(recept):
         data["image"] = beelden
@@ -468,13 +578,17 @@ def to_jsonld(recept: dict, url: str) -> dict:
     if bereiden or wachten:
         # Tandoor gebruikt totalTime alleen als de andere twee nul zijn.
         data["totalTime"] = f"PT{bereiden + wachten}M"
-    regels = [_ingredient_regel(i) for i in (recept.get("ingredients") or [])
+    regels = [_ingredient_regel(i) for i in _lijst(recept.get("ingredients"))
               if isinstance(i, dict)]
     data["recipeIngredient"] = [regel for regel in regels if regel]
+    # De tips komen als laatste stap(pen), na de echte. Niet in de
+    # beschrijving: Tandoor knipt die af op 512 tekens en zet hem boven de
+    # 256 ook nog eens voor stap 1, zodat je hem twee keer leest. Achteraan
+    # verschuift de nummering van de echte stappen niet.
     data["recipeInstructions"] = [{"@type": "HowToStep", "text": stap}
-                                  for stap in _stappen(recept)]
+                                  for stap in _stappen(recept) + _tips(recept)]
     trefwoorden = [_tekst(woord) for sleutel in ("courses", "cuisines")
-                   for woord in (recept.get(sleutel) or [])]
+                   for woord in _lijst(recept.get(sleutel))]
     if trefwoorden := [woord for woord in trefwoorden if woord]:
         data["keywords"] = ", ".join(dict.fromkeys(trefwoorden))
     return data

@@ -14,8 +14,8 @@ Het schema is instelbaar, zodat de tests kunnen laten zien wat er gebeurt als
 AH een veld niet (meer) kent: de brug moet dan een kaler recept leveren, geen
 foutmelding. Zelf draaien:
 
-    python mock_ah.py            # luistert op 8099
-    AH_API_URL=http://127.0.0.1:8099 python smoketest.py ...
+    python mock_ah.py            # luistert op 8098
+    AH_API_URL=http://127.0.0.1:8098 python smoketest.py --ah-only ...
 """
 
 from __future__ import annotations
@@ -154,7 +154,9 @@ def _snij(waarde, boom: dict):
 
 
 def create_app(*, schema=None, recept=None, token_leeft=7199,
-               oude_foutvorm=False, geen_token=False, fout_status=400) -> Flask:
+               oude_foutvorm=False, geen_token=False, fout_status=400,
+               suggesties=False, weigering_als_graphql=False,
+               half_antwoord=False, leeg_antwoord=False) -> Flask:
     """
     schema          : welke velden bestaan (standaard: alles uit SCHEMA)
     oude_foutvorm   : 'Cannot query field "x" on type "Y"' in plaats van de
@@ -162,6 +164,15 @@ def create_app(*, schema=None, recept=None, token_leeft=7199,
     geen_token      : het tokenendpoint geeft een antwoord zonder access_token
     fout_status     : status bij een afgewezen vraag; AH stuurt 400, de meeste
                       GraphQL-servers 200
+    suggesties      : zet er 'Did you mean "description"?' achter, zoals
+                      graphql-js doet - met een veld dat wél bestaat
+    weigering_als_graphql
+                    : een geweigerd token krijgt 401 met {"errors": [...]},
+                      de gewone vorm van een GraphQL-gateway, in plaats van
+                      {"message": ...}
+    half_antwoord   : het recept komt, maar met een melding in "errors" die
+                      niet over een veld gaat (een resolver die faalde)
+    leeg_antwoord   : /graphql antwoordt {} - geen data, geen errors
     """
     schema = schema or SCHEMA
     recept = recept if recept is not None else RECEPT
@@ -183,10 +194,15 @@ def create_app(*, schema=None, recept=None, token_leeft=7199,
     def graphql():
         if request.headers.get("Authorization") != "Bearer mock-anoniem-token":
             # AH geeft 401 als het token ontbreekt of verlopen is.
+            if weigering_als_graphql:
+                return jsonify({"errors": [{"message": "Unauthorized",
+                                            "extensions": {"code": "UNAUTHENTICATED"}}]}), 401
             return jsonify({"message": "Unauthorized"}), 401
         body = request.get_json(silent=True) or {}
         query = str(body.get("query") or "")
         app.config["gezien"].append(("graphql", query))
+        if leeg_antwoord:
+            return jsonify({})
         gevraagd = _gevraagde_velden(query)
         if not gevraagd:
             return jsonify({"errors": [{"message": "no recipe selection"}]})
@@ -197,13 +213,18 @@ def create_app(*, schema=None, recept=None, token_leeft=7199,
             # Zo doet AH het echt: status 400, geen "data", en de uitleg in
             # "errors". De meeste GraphQL-servers antwoorden hier met 200, dus
             # een client die alleen naar de status kijkt gooit die uitleg weg.
-            return jsonify({"errors": [_fout(pad, naam, typenaam, oude_foutvorm)
+            return jsonify({"errors": [_fout(pad, naam, typenaam, oude_foutvorm, suggesties)
                                        for pad, naam, typenaam in fouten]}), fout_status
 
         nummer = (body.get("variables") or {}).get("id")
         if nummer != recept.get("id"):
             return jsonify({"data": {"recipe": None}})
-        return jsonify({"data": {"recipe": _snij(recept, gevraagd)}})
+        antwoord = {"data": {"recipe": _snij(recept, gevraagd)}}
+        if half_antwoord:
+            antwoord["errors"] = [{"message": "Exception while fetching data "
+                                              "(/recipe/rating) : timeout",
+                                   "path": ["recipe", "rating"]}]
+        return jsonify(antwoord)
 
     @app.get("/__mock/gezien")
     def gezien():
@@ -212,9 +233,13 @@ def create_app(*, schema=None, recept=None, token_leeft=7199,
     return app
 
 
-def _fout(pad: str, naam: str, typenaam: str, oude_vorm: bool) -> dict:
+def _fout(pad: str, naam: str, typenaam: str, oude_vorm: bool,
+         suggesties: bool = False) -> dict:
     if oude_vorm:
-        return {"message": f'Cannot query field "{naam}" on type "{typenaam}".'}
+        tekst = f'Cannot query field "{naam}" on type "{typenaam}".'
+        if suggesties:
+            tekst += ' Did you mean "description" or "steps"?'
+        return {"message": tekst}
     return {
         "message": (f"Validation error (FieldUndefined@[{pad}]) : Field "
                     f"'{naam}' in type '{typenaam}' is undefined"),
