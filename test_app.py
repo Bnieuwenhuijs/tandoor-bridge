@@ -188,6 +188,7 @@ def test_status(brug):
     assert data["counts"] == {"wachtend": 1}
     assert data["worker"] is False      # in de tests draait hij niet mee
     assert data["tandoor"].startswith("http")
+    assert data["ah_api"] is True
 
 
 def test_check_bevestigt_de_verbinding(brug):
@@ -254,3 +255,239 @@ def test_een_onschrijfbare_datamap_zegt_wat_eraan_te_doen(tmp_path, client):
     assert "kan niet schrijven" in melding
     assert "uid" in melding
     assert "chown" in melding
+
+
+def test_logboek_staat_aan_zonder_main(brug):
+    """
+    Gunicorn roept main() nooit aan. Zonder configuratie in create_app bleef
+    de root-logger op WARNING en stond er niets in de Docker-logs.
+    """
+    import logging
+    assert logging.getLogger().handlers
+    assert logging.getLogger().level <= logging.INFO
+
+
+def test_json_body_die_geen_object_is(brug):
+    """Een lijst of losse string als body gaf een AttributeError, dus een 500."""
+    http, _, _ = brug
+    for body in ([1, 2, 3], "zomaar tekst", 42):
+        antwoord = http.post("/api/import", json=body)
+        assert antwoord.status_code == 400
+        assert "error" in antwoord.get_json()
+
+
+def test_onzinnige_limiet(brug):
+    http, store, _ = brug
+    store.add([AH_URL])
+    assert http.get("/api/items?limit=abc").status_code == 200
+    assert http.get("/api/items?limit=-5").status_code == 200
+    # En een te hoge limiet wordt nog steeds afgetopt.
+    assert len(http.get("/api/items?limit=99999").get_json()["items"]) == 1
+
+
+def test_onzinnige_instellingen_vallen_terug_op_de_standaard(monkeypatch):
+    """Een typefout in .env mag geen herstartlus opleveren."""
+    import app as appmodule
+    monkeypatch.setenv("IMPORT_DELAY_SECONDS", "vijf")
+    monkeypatch.setenv("PORT", "")
+    instellingen = appmodule.config_from_env()
+    assert instellingen["delay"] == 5.0
+    assert instellingen["port"] == 8095
+
+
+def test_diagnose_vergelijkt_de_manieren_van_ophalen(brug, monkeypatch):
+    """
+    De knop voor "waarom lukt deze site niet". Tandoor komt er niet aan te
+    pas, dus het kost ook geen plaats in zijn importlimiet.
+    """
+    http, _, _ = brug
+    import fetcher
+
+    def nep_probe(url, *, timeout=20):
+        return [
+            {"poging": "requests, minimale headers", "ok": False,
+             "status": 403, "reden": "geblokkeerd (status 403)"},
+            {"poging": "requests, volledige headers", "ok": True, "status": 200,
+             "final_url": url,
+             "pagina": {"bytes": 1234, "titel": "Kip korma", "heeft_schema": True,
+                        "ld_json_blokken": 1}},
+            {"poging": "curl_cffi, impersonate=chrome", "ok": False,
+             "reden": "curl_cffi is hier niet geïnstalleerd"},
+        ]
+
+    monkeypatch.setattr(fetcher, "probe", nep_probe)
+    data = http.get("/api/diagnose?url=https://www.ah.nl/r/921580").get_json()
+    assert data["url"] == "https://www.ah.nl/allerhande/recept/R-R921580"
+    assert "volledige headers" in data["conclusie"]
+    assert len(data["pogingen"]) == 3
+
+
+def test_diagnose_zonder_url(brug):
+    http, _, _ = brug
+    assert http.get("/api/diagnose").status_code == 400
+
+
+def test_ah_laat_zien_wat_de_app_api_geeft(brug, monkeypatch):
+    """De knop om te kijken of de AH-route werkt, zonder Tandoor erbij."""
+    import ah_api
+    import mock_ah
+    from conftest import MockServer
+
+    http, _, _ = brug
+    ah = MockServer(mock_ah.create_app())
+    monkeypatch.setattr(ah_api, "API_URL", ah.url)
+    ah_api.reset_token()
+    ah_api.reset_schema()
+    try:
+        data = http.get("/api/ah?url=https://www.ah.nl/allerhande/recept/"
+                        "R-R1194169/traybake-met-kip").get_json()
+    finally:
+        ah.stop()
+        ah_api.reset_token()
+        ah_api.reset_schema()
+
+    assert data["ok"] is True
+    assert data["recept_id"] == 1194169
+    assert data["porties"] == "4 personen"
+    assert data["bereidingstijd"] == "PT20M"
+    # De hele regel met eenheid: dat is wat Tandoor straks ontleedt.
+    assert data["ingredienten"][0] == "600 g kipfilet"
+    # Drie stappen, en de tip als vierde.
+    assert len(data["stappen"]) == 4
+    assert data["stappen"][-1].startswith("Tip: ")
+
+
+def test_ah_meldt_netjes_dat_ah_niet_antwoordt(brug, monkeypatch):
+    import ah_api
+
+    http, _, _ = brug
+    monkeypatch.setattr(ah_api, "API_URL", "http://127.0.0.1:1")
+    ah_api.reset_token()
+    try:
+        data = http.get("/api/ah?url=https://www.ah.nl/allerhande/recept/R-R1/x").get_json()
+    finally:
+        ah_api.reset_token()
+    assert data["ok"] is False
+    assert "niet bereikbaar" in data["reden"]
+
+
+def test_ah_zonder_ah_link(brug):
+    http, _, _ = brug
+    assert http.get("/api/ah?url=https://www.leukerecepten.nl/x/").status_code == 400
+    assert http.get("/api/ah").status_code == 400
+
+
+def test_status_zegt_of_de_browser_container_antwoordt(brug, monkeypatch):
+    """
+    Ingesteld zijn en antwoorden zijn twee verschillende dingen. Dat verschil
+    is wat je wil zien als Albert Heijn niet lukt.
+    """
+    http, _, _ = brug
+    import fetcher
+
+    monkeypatch.setattr(fetcher, "RENDERER_URL", "http://tandoor-bridge-renderer:8096")
+    monkeypatch.setattr(fetcher, "renderer_health", lambda url, timeout=3: False)
+    data = http.get("/api/status").get_json()
+    assert data["browser"] == "http://tandoor-bridge-renderer:8096"
+    assert data["browser_bereikbaar"] is False
+
+
+def test_status_zonder_browser_container(brug, monkeypatch):
+    http, _, _ = brug
+    import fetcher
+
+    monkeypatch.setattr(fetcher, "RENDERER_URL", "")
+    data = http.get("/api/status").get_json()
+    assert data["browser"] is None
+    assert data["browser_bereikbaar"] is None
+
+
+# ---------------------------------------------------------------- bookmarklet
+
+def test_bookmarklet_voegt_een_recept_toe(brug, tandoor):
+    """
+    De route voor sites die geen enkele server-side aanvraag toelaten: jouw
+    browser levert de HTML aan, en alles daarna is een gewone import.
+    """
+    from conftest import AH_HTML, AH_URL
+
+    http, store, _ = brug
+    antwoord = http.post("/bookmarklet", data={"url": AH_URL, "html": AH_HTML})
+    assert antwoord.status_code == 200
+
+    pagina = antwoord.get_data(as_text=True)
+    assert "Toegevoegd" in pagina
+    assert "Kip korma met spinazie" in pagina
+    assert "/recipe/1" in pagina                 # link naar Tandoor
+
+    # En de geschiedenis van de brug weet ervan, met de bron erbij.
+    item = store.items()[0]
+    assert item["status"] == "klaar"
+    assert item["source"] == "bookmarklet"
+    assert tandoor.state()["recipes"][0]["source_url"] == AH_URL
+
+
+def test_bookmarklet_met_een_grote_pagina(brug):
+    """
+    Werkzeug kapt formuliervelden standaard op 500 KB af. Een receptpagina is
+    groter, en dan krijg je een 413 zonder uitleg.
+    """
+    from conftest import AH_HTML, AH_URL
+
+    http, _, _ = brug
+    groot = AH_HTML.replace("</body>", "<p>" + "x" * 900_000 + "</p></body>")
+    assert len(groot) > 500_000
+
+    antwoord = http.post("/bookmarklet", data={"url": AH_URL, "html": groot})
+    assert antwoord.status_code == 200
+    assert "Toegevoegd" in antwoord.get_data(as_text=True)
+
+
+def test_bookmarklet_tweede_keer_zegt_dat_het_er_al_staat(brug):
+    from conftest import AH_HTML, AH_URL
+
+    http, _, _ = brug
+    http.post("/bookmarklet", data={"url": AH_URL, "html": AH_HTML})
+    antwoord = http.post("/bookmarklet", data={"url": AH_URL, "html": AH_HTML})
+    assert "Stond er al" in antwoord.get_data(as_text=True)
+
+
+def test_bookmarklet_zonder_html(brug):
+    http, _, _ = brug
+    antwoord = http.post("/bookmarklet", data={"url": "https://www.ah.nl/r/1"})
+    pagina = antwoord.get_data(as_text=True)
+    assert "Niet gelukt" in pagina
+    assert "geen HTML" in pagina
+
+
+def test_bookmarklet_met_een_pagina_zonder_recept(brug):
+    http, _, _ = brug
+    antwoord = http.post("/bookmarklet", data={
+        "url": "https://www.ah.nl/allerhande/recept/R-R1",
+        "html": "<html><head><title>Even geduld…</title></head><body>x</body></html>"})
+    pagina = antwoord.get_data(as_text=True)
+    assert "Niet gelukt" in pagina
+    assert "geen recept-schema" in pagina
+
+
+def test_ah_zegt_het_als_de_route_uitstaat(brug, monkeypatch):
+    import ah_api
+
+    http, _, _ = brug
+    monkeypatch.setattr(ah_api, "AH_API_AAN", False)
+    data = http.get("/api/ah?url=https://www.ah.nl/allerhande/recept/R-R1/x").get_json()
+    assert data["ok"] is False and "AH_API=0" in data["reden"]
+    assert http.get("/api/status").get_json()["ah_api"] is False
+
+
+def test_ah_geeft_bij_een_onverwachte_fout_toch_een_antwoord(brug, monkeypatch):
+    # Dit is de knop waarmee je uitzoekt wat er misgaat; een kale 500 zegt dan
+    # niets.
+    import ah_api
+
+    http, _, _ = brug
+    monkeypatch.setattr(ah_api, "fetch_recipe", lambda *a, **k: {"title": None, "ingredients": 5})
+    monkeypatch.setattr(ah_api, "to_jsonld", lambda *a, **k: 1 / 0)
+    antwoord = http.get("/api/ah?url=https://www.ah.nl/allerhande/recept/R-R1/x")
+    assert antwoord.status_code == 200
+    assert "ZeroDivisionError" in antwoord.get_json()["reden"]

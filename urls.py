@@ -110,11 +110,17 @@ def normalize_url(url: str) -> str:
     hostnaam = host.rsplit(":", 1)[0] if host.count(":") == 1 else host
     scheme = parts.scheme.lower() if _PRIVATE_HOST_RE.match(hostnaam) else "https"
 
-    if host.endswith("ah.nl"):
+    if host in ("ah.nl", "www.ah.nl"):
         if short := _AH_SHORT_PATH_RE.match(path):
             # De korte vorm draagt geen informatie die we willen bewaren, dus
             # de trackingparameters van de deelknop gaan er in hun geheel af.
             path, query = f"/allerhande/recept/R-R{short.group(1)}", ""
+            # En de host wordt die van AH zelf. Dit wordt de source_url, en
+            # Tandoor vergelijkt die letterlijk: met ah.nl erin herkent hij
+            # een recept van www.ah.nl niet als hetzelfde, krijgt het het
+            # trefwoord "ah.nl" in plaats van "www.ah.nl", en vuurt een Food
+            # Replace-regel die op www\.ah\.nl let niet.
+            host = "www.ah.nl"
 
     # Het fragment (#ingredienten) wijst naar een stuk van dezelfde pagina en
     # zegt niets over welk recept het is.

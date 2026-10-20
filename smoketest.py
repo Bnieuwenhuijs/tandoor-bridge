@@ -18,7 +18,7 @@ import argparse
 import os
 import sys
 
-from fetcher import FetchError, fetch_image, fetch_page
+from fetcher import FetchError, describe_page, fetch_image, fetch_page
 from tandoor import TandoorClient, TandoorError, TandoorNoRecipe, TandoorThrottled
 from urls import normalize_url
 
@@ -38,6 +38,67 @@ def afbreken(melding, hint=None):
     sys.exit(1)
 
 
+def ah_only(url: str):
+    """
+    Alleen de Albert Heijn-route: werkt api.ah.nl vanaf deze machine?
+
+    Dit is de test voor de ene site waar het ophalen van de pagina niet lukt.
+    Tandoor komt er niet aan te pas, dus je hebt er ook geen token voor nodig.
+    """
+    import ah_api
+
+    url = normalize_url(url)
+    stap(1, f"Receptnummer uit de link: {url}")
+    nummer = ah_api.recipe_id_from_url(url)
+    if nummer is None:
+        afbreken("dit is geen AH-receptlink",
+                 "een link als https://www.ah.nl/allerhande/recept/R-R1194169/... "
+                 "of https://ah.nl/r/1194169")
+    print(f"{GOED} recept {nummer}")
+
+    stap(2, "Anoniem token bij de AH-app-API")
+    try:
+        ah_api.token()
+    except ah_api.AhError as e:
+        afbreken(e.reason,
+                 "geeft AH hier een 403, dan weigert hij dit IP; probeer het "
+                 "vanaf de NAS en niet vanuit een datacenter")
+    print(f"{GOED} token gekregen")
+
+    stap(3, "Het recept opvragen")
+    try:
+        recept = ah_api.fetch_recipe(nummer)
+    except ah_api.AhError as e:
+        afbreken(e.reason, "zet AH_API=0 om deze route uit te zetten; voor AH "
+                           "blijft dan de bookmarklet over")
+    print(f"{GOED} {recept.get('title')}")
+    print(f"{INFO} velden die AH gaf: {', '.join(sorted(recept.keys()))}")
+
+    stap(4, "Wat Tandoor straks te ontleden krijgt")
+    schema = ah_api.to_jsonld(recept, url)
+    print(f"{INFO} porties: {schema.get('recipeYield') or '(geen)'}")
+    print(f"{INFO} bereiden: {schema.get('prepTime') or '(geen)'}, "
+          f"wachten: {schema.get('cookTime') or '(geen)'}")
+    print(f"{INFO} foto: {(schema.get('image') or ['(geen)'])[0]}")
+    for regel in schema.get("recipeIngredient") or []:
+        print(f"{INFO} {regel}")
+    if not schema.get("recipeIngredient"):
+        print(f"{FOUT} geen ingrediënten; zo heeft het geen zin")
+        sys.exit(1)
+    print(f"{GOED} {len(schema.get('recipeInstructions') or [])} stappen")
+    eerste = (schema["recipeIngredient"] or [""])[0]
+    if not any(teken.isdigit() for teken in eerste):
+        print(f"{INFO} let op: er staat geen hoeveelheid in de regel, dus Unit "
+              f"Alias heeft niets te doen")
+
+    stap(5, "De pagina die naar Tandoor gaat")
+    html = ah_api.to_html(recept, url)
+    print(f"{GOED} {len(html) // 1024 or 1} KB met het recept-schema erin")
+    print(f"{INFO} de brug stuurt deze HTML naar POST /api/recipe-from-source/, "
+          f"net als bij een pagina die hij wél kon ophalen")
+    print("\nKlaar: de AH-route werkt vanaf deze machine.")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -46,7 +107,13 @@ def main():
                         help="alleen ophalen en laten ontleden, niets in Tandoor zetten")
     parser.add_argument("--no-impersonate", action="store_true",
                         help="geen tweede poging met curl_cffi")
+    parser.add_argument("--ah-only", action="store_true",
+                        help="alleen de Albert Heijn-route proberen; geen Tandoor, "
+                             "geen token nodig")
     args = parser.parse_args()
+
+    if args.ah_only:
+        return ah_only(args.url)
 
     tandoor_url = os.environ.get("TANDOOR_URL", "").strip()
     token = os.environ.get("TANDOOR_TOKEN", "").strip()
@@ -88,6 +155,23 @@ def main():
           f"(status {pagina.status})")
     if pagina.final_url != url:
         print(f"{INFO} doorgestuurd naar {pagina.final_url}")
+
+    beschrijving = describe_page(pagina.html)
+    print(f"{INFO} titel: {beschrijving['titel'] or '(geen)'}")
+    print(f"{INFO} ld+json-blokken: {beschrijving['ld_json_blokken']}")
+    if beschrijving["heeft_schema"]:
+        print(f"{GOED} er staat een recept-schema in de pagina")
+    else:
+        print(f"{FOUT} geen recept-schema in de pagina")
+        if beschrijving["lijkt_cookiemuur"]:
+            print(f"{INFO} dit lijkt een cookiemelding en niet het recept")
+        elif beschrijving["lijkt_js_pagina"]:
+            print(f"{INFO} de pagina bouwt zichzelf met JavaScript op, dus het "
+                  f"schema staat niet in de ruwe HTML")
+        afbreken("Tandoor kan hier niets mee; zie de README bij "
+                 "'een site blokkeert toch'",
+                 "Tandoor geeft op zo'n pagina een kale 500, want zijn "
+                 "data-tak vangt NoSchemaFoundInWildMode niet af")
 
     stap(4, "Tandoor laat ontleden")
     try:

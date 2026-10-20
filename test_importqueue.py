@@ -164,6 +164,60 @@ def test_een_recept_helemaal_door_de_keten(queue, store, tandoor):
     assert state["images"]["1"] == "recept.jpg"
 
 
+def test_een_ah_recept_gaat_via_de_api_naar_tandoor(store, client, tandoor, monkeypatch):
+    """
+    De route waarvoor de brug bestaat, van link tot recept in Tandoor.
+
+    Hier draait het échte fetch_page(), dus de AH-poging zit erin. De pagina
+    van ah.nl wordt niet opgehaald: de nagebootste app-API levert het recept,
+    en Tandoor krijgt daar een pagina van te zien.
+    """
+    import ah_api
+    import mock_ah
+    from conftest import MockServer
+    from fetcher import fetch_page
+
+    import fetcher
+
+    ah = MockServer(mock_ah.create_app())
+    monkeypatch.setattr(ah_api, "API_URL", ah.url)
+    # De andere pogingen zouden www.ah.nl echt benaderen. Gaat de AH-route
+    # hier mis, dan moet de test dat zeggen - niet stilletjes een 403 van
+    # Akamai ophalen en de schuld bij Albert Heijn leggen.
+    for poging in ("_attempt_requests", "_attempt_curl", "_attempt_renderer"):
+        monkeypatch.setattr(fetcher, poging, lambda *a, _p=poging, **k: pytest.fail(
+            f"{_p} draaide: de AH-route is niet gelukt"))
+    ah_api.reset_token()
+    ah_api.reset_schema()
+    url = "https://www.ah.nl/allerhande/recept/R-R1194169/traybake-met-kip"
+    try:
+        rij = ImportQueue(store, client, delay=0, fetch=fetch_page,
+                          fetch_photo=maak_fotofetch())
+        [item_id] = store.add([url]).added
+        uitkomst = rij.process_once()
+    finally:
+        ah.stop()
+        ah_api.reset_token()
+        ah_api.reset_schema()
+
+    assert uitkomst["status"] == KLAAR
+    item = store.item(item_id)
+    assert item["title"] == "Traybake met kip, paprika, zwarte bonen en chipotle"
+    assert item["error"] is None
+
+    recept = tandoor.state()["recipes"][0]
+    assert recept["source_url"] == url
+    # Dit is waar het om gaat: Tandoor heeft de regel ontleed, niet wij. Dus
+    # werken Food Alias, Unit Alias en de rest ook op deze recepten.
+    eerste = recept["steps"][0]["ingredients"][0]
+    assert eerste["original_text"] == "600 g kipfilet"
+    assert eerste["amount"] == 600.0
+    assert eerste["unit"]["name"] == "g"
+    assert eerste["food"]["name"] == "kipfilet"
+    # En het domein-trefwoord klopt, want de canonical wees naar ah.nl.
+    assert {"id": None, "name": "www.ah.nl"} in recept["keywords"]
+
+
 def test_een_fout_stopt_de_rest_niet(store, client):
     """Precies wat de lijst-import van Tandoor zelf verkeerd doet."""
     pogingen = []
@@ -187,14 +241,32 @@ def test_een_fout_stopt_de_rest_niet(store, client):
     assert klaar[0]["recipe_id"] == 1
 
 
-def test_pagina_zonder_recept_krijgt_tandoors_eigen_melding(store, client):
+def test_pagina_zonder_schema_wordt_niet_naar_tandoor_gestuurd(store, client, tandoor):
+    """
+    Een pagina zonder recept-schema geeft bij Tandoor een kale 500, want zijn
+    data-tak vangt NoSchemaFoundInWildMode niet af. Die aanroep doen we dus
+    niet - hij kost een plaats in de limiet en zegt niets.
+    """
     queue = ImportQueue(store, client, delay=0,
-                        fetch=maak_fetch("<html><body>kattenfoto</body></html>"),
+                        fetch=maak_fetch("<html><head><title>Even geduld…</title>"
+                                         "</head><body>laden</body></html>"),
                         fetch_photo=maak_fotofetch())
     [item_id] = store.add([AH_URL]).added
 
     assert queue.process_once()["status"] == MISLUKT
-    # De melding van Tandoor, niet een eigen gok.
+    fout = store.item(item_id)["error"]
+    assert "geen recept-schema" in fout
+    assert "Even geduld" in fout                        # je ziet wát er kwam
+    assert "Tandoor vond geen recept" not in fout        # niet aan Tandoor toeschrijven
+    assert tandoor.state()["import_calls"] == 0
+
+
+def test_pagina_met_ander_schema_krijgt_tandoors_eigen_melding(store, client):
+    queue = ImportQueue(store, client, delay=0, fetch=maak_fetch('<html><head><title>Kattenfoto</title><script type="application/ld+json">{"@context":"https://schema.org","@type":"Article","name":"Kat"}</script></head><body>miauw</body></html>'),
+                        fetch_photo=maak_fotofetch())
+    [item_id] = store.add([AH_URL]).added
+
+    assert queue.process_once()["status"] == MISLUKT
     assert "No usable data could be found." in store.item(item_id)["error"]
 
 

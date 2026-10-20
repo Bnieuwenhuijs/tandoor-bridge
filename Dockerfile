@@ -20,9 +20,16 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py fetcher.py importqueue.py tandoor.py urls.py ./
-COPY mock_tandoor.py smoketest.py ./
+COPY app.py ah_api.py fetcher.py importqueue.py tandoor.py urls.py ./
+COPY mock_tandoor.py mock_ah.py smoketest.py ./
 COPY templates/ ./templates/
+
+# Deze lijst is met de hand bijgehouden en is al twee keer achtergebleven bij
+# de code; een vergeten regel breekt pas bij de start van de container.
+# test_image.py leest de COPY-regels en loopt de imports na, en dit is de
+# tweede vangst: hier valt de build om, met de naam van de module erbij, in
+# plaats van dat er een image uitkomt die niet opstart.
+RUN python -c "import app, smoketest, mock_tandoor, mock_ah"
 
 # Niet als root draaien, en /data moet van de brug zijn want daar komt de
 # SQLite-database in.

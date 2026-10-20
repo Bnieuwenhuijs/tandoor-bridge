@@ -31,6 +31,13 @@ services:
     # update niets aan deze regel te veranderen.
     image: ghcr.io/bnieuwenhuijs/tandoor-bridge:latest
     restart: unless-stopped
+    # Haal het image elke start opnieuw op. Zonder dit ziet TrueNAS een
+    # verschoven :latest niet: de Update-knop kijkt naar de app-configuratie,
+    # en die verandert niet als alleen de tag naar een nieuw image wijst.
+    # Keerzijde: start de NAS op terwijl er geen internet is, dan mislukt de
+    # pull en start de container niet. Haal deze regel weg als je dat erger
+    # vindt dan handmatig bijwerken.
+    pull_policy: always
 
     # 568 is de apps-gebruiker van TrueNAS. De dataset bij volumes moet van
     # die gebruiker zijn, anders kan de brug z'n database niet aanmaken.
@@ -51,19 +58,28 @@ services:
       IMPORT_DELAY_SECONDS: "5"
       DATA_DIR: "/data"
       SEND_PROPERTIES: "false"
+      # Verwijst naar de tweede container hieronder, voor sites die hun recept
+      # pas met JavaScript opbouwen. Leeg laten = geen browser. Albert Heijn
+      # heeft hem niet nodig: dat gaat via de app-API.
+      RENDERER_URL: "http://tandoor-bridge-renderer:8096"
       LOG_LEVEL: "INFO"
 
     ports:
       - "8095:8095"
 
     volumes:
-      # Een pad op de host, zodat de geschiedenis in een dataset staat die
-      # meegaat in je snapshots. Pas <pool> aan.
+      # Een pad op de host, zodat de geschiedenis in een eigen dataset staat
+      # die meegaat in je snapshots. Pas <pool> aan, maak de dataset vooraf
+      # aan, en geef hem aan uid/gid 568.
       #
-      # Een Docker-volume kan ook (- bridgedata:/data plus een volumes-blok
-      # onderaan); dan hoef je niets te chownen omdat Docker het eigendom uit
-      # het image overneemt, maar dan moet de regel user: hierboven weg én
-      # valt de map buiten je snapshots.
+      # Wil je dat gepruts met rechten niet, zie VARIANT B onderaan.
+      #
+      # Een ixVolume is hier géén optie: dat is een TrueNAS-schemabegrip en
+      # geen Docker-Compose-begrip, dus het bestaat alleen in de
+      # formulier-variant van Custom App - en die laat je de YAML-editor
+      # voorgoed kwijtraken. TrueNAS raadt ixVolumes voor data die je wilt
+      # houden trouwens zelf af, omdat ze in de verborgen ix-apps-dataset
+      # landen en back-ups bemoeilijken.
       - /mnt/<pool>/apps/tandoor-bridge/data:/data
 
     logging:
@@ -73,3 +89,73 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+  # Voor Albert Heijn is deze container niet meer nodig: die recepten gaan via
+  # de app-API van AH (zie de README bij "Albert Heijn: de app-API"). Hij
+  # blijft voor andere sites die hun recept pas met JavaScript opbouwen, of
+  # die een blokkade als gewone pagina teruggeven.
+  #
+  # De brug gebruikt hem alleen als de gewone pogingen falen of een pagina
+  # zonder recept opleveren. Haal deze service en RENDERER_URL weg als je hem
+  # niet nodig hebt; dan blijft alleen de lichte container over.
+  #
+  # De browser start pas bij het eerste verzoek en sluit zichzelf weer af na
+  # BROWSER_IDLE_SECONDS zonder werk, dus tussen twee importrondes kost dit
+  # geen geheugen.
+  tandoor-bridge-renderer:
+    # :latest wordt alleen van main gebouwd. Staat de nieuwste wijziging nog in
+    # een pull request, zet dan tijdelijk de naam van de branch als tag -
+    # bijvoorbeeld :claude-practical-johnson-jsrrgm.
+    image: ghcr.io/bnieuwenhuijs/tandoor-bridge-renderer:latest
+    pull_policy: always
+    restart: unless-stopped
+    environment:
+      BROWSER_IDLE_SECONDS: "120"
+      NAV_TIMEOUT_MS: "30000"
+      LOG_LEVEL: "INFO"
+    # Geen ports: alleen de brug praat ermee, binnen het Docker-netwerk. Zet
+    # hem niet open - hij haalt elke URL op die je hem geeft.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# ---------------------------------------------------------------------------
+# VARIANT B: met een named volume, zonder iets vooraf aan te maken
+# ---------------------------------------------------------------------------
+# Dit is de kortste weg naar werkend. Docker vult een leeg named volume met de
+# inhoud én het eigendom uit het image, en daar is /data van uid 10001 - dus
+# geen dataset aanmaken, geen chown, geen ACL's.
+#
+# Let op de twee verschillen met hierboven, en neem ze samen over: er staat
+# GEEN user:-regel (de container draait als 10001, de eigenaar van het volume),
+# en er is een volumes-blok op het hoogste niveau.
+#
+# De keerzijde is dezelfde als bij een ixVolume: je geschiedenis zit in Dockers
+# eigen map en niet in een eigen dataset, dus minder handig voor back-ups.
+#
+# services:
+#   tandoor-bridge:
+#     image: ghcr.io/bnieuwenhuijs/tandoor-bridge:latest
+#     restart: unless-stopped
+#     environment:
+#       TANDOOR_URL: "http://192.168.1.130:30290"
+#       TANDOOR_TOKEN: "tda_vul_hier_je_eigen_token_in"
+#       TANDOOR_PUBLIC_URL: ""
+#       PORT: "8095"
+#       IMPORT_DELAY_SECONDS: "5"
+#       DATA_DIR: "/data"
+#       SEND_PROPERTIES: "false"
+#       LOG_LEVEL: "INFO"
+#     ports:
+#       - "8095:8095"
+#     volumes:
+#       - bridgedata:/data
+#     logging:
+#       driver: json-file
+#       options:
+#         max-size: "10m"
+#         max-file: "3"
+# volumes:
+#   bridgedata:

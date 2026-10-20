@@ -206,11 +206,14 @@ def test_andere_url_is_geen_duplicaat(client):
 
 # ------------------------------------------------------- foutgevallen
 
-def test_pagina_zonder_recept(client):
+def test_pagina_met_ander_schema_krijgt_tandoors_eigen_melding(client):
+    """
+    Hier staat wél een ld+json-blok in, dus onze voorcontrole laat het door en
+    is het Tandoor die er niets mee kan. Dan moet zijn eigen melding
+    doorkomen, niet een gok van ons.
+    """
     with pytest.raises(TandoorNoRecipe) as fout:
-        client.recipe_from_source("https://example.com/geen-recept",
-                                  "<html><head></head><body>kattenfoto</body></html>")
-    # De melding van Tandoor zelf, niet een eigen gok.
+        client.recipe_from_source("https://example.com/geen-recept", '<html><head><title>Kattenfoto</title><script type="application/ld+json">{"@context":"https://schema.org","@type":"Article","name":"Kat"}</script></head><body>miauw</body></html>')
     assert fout.value.message == "No usable data could be found."
 
 
@@ -421,7 +424,9 @@ def test_te_grote_pagina_wordt_tegengehouden(client):
     Django neemt niet meer dan 2,5 MB aan en antwoordt dan met gewone HTML in
     plaats van een melding. Beter hier een leesbare fout.
     """
-    reus = "<html><head></head><body>" + "x" * (DJANGO_BODY_LIMIT + 1) + "</body></html>"
+    # Mét schema, anders houdt de voorcontrole hem al eerder tegen.
+    reus = ('<html><head><script type="application/ld+json">{"@type":"Recipe"}'
+            '</script></head><body>' + "x" * (DJANGO_BODY_LIMIT + 1) + "</body></html>")
     with pytest.raises(TandoorError, match="te groot voor Tandoor"):
         client.recipe_from_source(AH_URL, reus)
 
@@ -429,3 +434,111 @@ def test_te_grote_pagina_wordt_tegengehouden(client):
 def test_prepare_data_blijft_omkeerbaar():
     assert unquote(prepare_data(AH_HTML, AH_URL)) == with_canonical(
         sanitise_html(AH_HTML), AH_URL)
+
+
+def test_een_500_wordt_niet_herhaald():
+    """
+    Een 500 komt uit Tandoor zelf en is bijna altijd deterministisch: dezelfde
+    pagina geeft dezelfde fout. Nog twee keer sturen kost drie plaatsen in de
+    importlimiet van 60 per uur en levert hetzelfde resultaat.
+    """
+    from flask import Flask, jsonify
+
+    app = Flask(__name__)
+    aanroepen = []
+
+    @app.post("/api/recipe-from-source/")
+    def stuk():
+        aanroepen.append(1)
+        return jsonify({"detail": "kapot"}), 500
+
+    from conftest import MockServer
+
+    server = MockServer(app)
+    geslapen = []
+    client = TandoorClient(server.url, "tda_x", sleep=geslapen.append)
+    try:
+        with pytest.raises(TandoorError) as fout:
+            client.recipe_from_source(AH_URL, AH_HTML)
+        assert len(aanroepen) == 1          # precies één keer
+        assert geslapen == []               # en niet gewacht
+        # En de melding wijst naar waar het antwoord zelf niets zegt.
+        assert "logboek van de Tandoor-container" in fout.value.message
+    finally:
+        server.stop()
+
+
+def test_een_503_wordt_wel_herhaald():
+    """Die hoort bij een herstart of een proxy ertussen, en gaat voorbij."""
+    from flask import Flask, jsonify
+
+    app = Flask(__name__)
+    aanroepen = []
+
+    @app.post("/api/recipe-from-source/")
+    def herstart():
+        aanroepen.append(1)
+        return jsonify({"detail": "even niet"}), 503
+
+    from conftest import MockServer
+    server = MockServer(app)
+    geslapen = []
+    client = TandoorClient(server.url, "tda_x", max_retries=3, sleep=geslapen.append)
+    try:
+        with pytest.raises(TandoorError):
+            client.recipe_from_source(AH_URL, AH_HTML)
+        assert len(aanroepen) == 3
+        assert geslapen == [2, 4]
+    finally:
+        server.stop()
+
+
+# ------------------------------------------------- pagina's zonder schema
+
+def test_pagina_zonder_schema_gaat_niet_naar_tandoor(client, tandoor):
+    """
+    Tandoor geeft hier geen nette melding maar een 500: zijn data-tak vangt
+    NoSchemaFoundInWildMode niet af. Die aanroep kost een plaats in de limiet
+    van 60 per uur en levert een foutmelding die niets uitlegt, dus doen we
+    hem niet.
+    """
+    from tandoor import NoRecipeSchema
+
+    kaal = "<html><head><title>Even geduld…</title></head><body>laden</body></html>"
+    with pytest.raises(NoRecipeSchema) as fout:
+        client.recipe_from_source(AH_URL, kaal)
+
+    assert "geen recept-schema" in fout.value.message
+    assert 'Even geduld' in fout.value.message        # je ziet wát je kreeg
+    assert tandoor.state()["import_calls"] == 0        # niets verstuurd
+
+
+def test_een_cookiemuur_wordt_als_zodanig_benoemd(client):
+    from tandoor import NoRecipeSchema
+
+    muur = ("<html><head><title>Cookies</title></head><body>"
+            "We gebruiken cookies om je ervaring te verbeteren. "
+            "Accepteer cookies om verder te gaan.</body></html>")
+    with pytest.raises(NoRecipeSchema, match="cookiemelding"):
+        client.recipe_from_source(AH_URL, muur)
+
+
+def test_een_javascript_pagina_wordt_als_zodanig_benoemd(client):
+    from tandoor import NoRecipeSchema
+
+    spa = ('<html><head><title>Kip korma</title></head><body><div id="root"></div>'
+           '<script id="__NEXT_DATA__" type="application/json">{"props":{}}</script>'
+           '</body></html>')
+    with pytest.raises(NoRecipeSchema, match="JavaScript"):
+        client.recipe_from_source(AH_URL, spa)
+
+
+def test_microdata_telt_ook_als_schema(client):
+    """
+    recipe_scrapers leest via extruct ook microdata, dus alleen op ld+json
+    controleren zou pagina's onnodig afwijzen.
+    """
+    from fetcher import describe_page
+
+    micro = '<html><body><div itemscope itemtype="https://schema.org/Recipe">x</div></body></html>'
+    assert describe_page(micro)["heeft_schema"] is True

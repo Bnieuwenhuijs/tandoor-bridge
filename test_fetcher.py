@@ -6,6 +6,7 @@ staat hieronder letterlijk in AKAMAI_BLOKKADE, overgenomen van een echte
 geweigerde aanvraag.
 """
 
+import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -36,9 +37,38 @@ RECEPTPAGINA = (
 
 JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 512
 
+# Wat een echte browser zou teruggeven: dezelfde pagina, maar mét het schema
+# dat Akamai pas na het uitvoeren van JavaScript laat zien.
+MET_SCHEMA = (
+    '<html><head><title>Kip korma</title>'
+    '<script type="application/ld+json">'
+    '{"@context":"https://schema.org","@type":"Recipe","name":"Kip korma"}'
+    '</script></head><body>recept</body></html>'
+)
+
 
 class _Handler(BaseHTTPRequestHandler):
     ontvangen: list = []
+    # Wat de nagebootste browser-container antwoordt; tests zetten dit.
+    render_html: str | None = MET_SCHEMA
+    render_fout: str | None = None
+
+    def do_POST(self):
+        lengte = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(lengte)
+        _Handler.ontvangen.append((self.path, dict(self.headers)))
+        if self.path != "/render":
+            self._stuur(404, "application/json", b'{"error":"onbekend"}')
+            return
+        if _Handler.render_fout:
+            self._stuur(502, "application/json",
+                        json.dumps({"error": _Handler.render_fout}).encode())
+            return
+        gevraagd = json.loads(body or b"{}").get("url", "")
+        self._stuur(200, "application/json", json.dumps({
+            "html": _Handler.render_html, "final_url": gevraagd,
+            "status": 200, "titel": "Kip korma",
+        }).encode())
 
     def do_GET(self):
         _Handler.ontvangen.append((self.path, dict(self.headers)))
@@ -48,6 +78,13 @@ class _Handler(BaseHTTPRequestHandler):
             self._stuur(403, "text/html", AKAMAI_BLOKKADE)
         elif self.path == "/zachte-blokkade":
             self._stuur(200, "text/html", AKAMAI_BLOKKADE)
+        elif self.path == "/alleen-met-volledige-headers":
+            # Sommige sites willen juist de headers zien die een echte
+            # navigatie verraden; die geven de minimale set een 403.
+            if "Sec-Fetch-Mode" in self.headers:
+                self._stuur(200, "text/html; charset=utf-8", RECEPTPAGINA)
+            else:
+                self._stuur(403, "text/html", AKAMAI_BLOKKADE)
         elif self.path == "/verdwenen":
             self._stuur(404, "text/html", b"<html>niet gevonden</html>")
         elif self.path == "/leeg":
@@ -81,6 +118,8 @@ def site():
     server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     _Handler.ontvangen = []
+    _Handler.render_html = MET_SCHEMA
+    _Handler.render_fout = None
     try:
         yield f"http://127.0.0.1:{server.server_address[1]}"
     finally:
@@ -104,12 +143,28 @@ def test_gewone_pagina_komt_onbewerkt_binnen(site):
     assert '<link rel="canonical" href="https://www.ah.nl/allerhande/recept/R-R921580"/>' in result.html
 
 
-def test_browserheaders_gaan_mee(site):
+def test_eerste_poging_gebruikt_de_bewezen_headers(site):
+    """
+    De eerste poging is de set uit recipe_parser, en dat is geen willekeurige
+    keuze. De uitgebreidere set hieronder leverde bij AH juist een 403 op:
+    Akamai kijkt naar de combinatie, en Chrome-headers zonder bijpassende
+    TLS-vingerafdruk zijn verdachter dan een kale User-Agent.
+    """
     fetch_page(f"{site}/ok")
     headers = laatste_headers("/ok")
     assert "Chrome/126" in headers["User-Agent"]
     assert headers["Accept-Language"] == "nl-NL,nl;q=0.9,en;q=0.8"
-    # De headers die een echte navigatie verraden, en die Tandoor zelf niet stuurt.
+    assert "Sec-Fetch-Mode" not in headers          # bewust niet, nog niet
+    assert "Sec-Ch-Ua" not in headers
+
+
+def test_tweede_poging_stuurt_de_volledige_headers(site):
+    """En een site die juist dié headers wil, komt alsnog binnen."""
+    result = fetch_page(f"{site}/alleen-met-volledige-headers")
+    assert result.via == "requests+headers"
+    assert "Kip korma met spinazie" in result.html
+
+    headers = laatste_headers("/alleen-met-volledige-headers")
     assert headers["Sec-Fetch-Mode"] == "navigate"
     assert headers["Upgrade-Insecure-Requests"] == "1"
 
@@ -180,7 +235,11 @@ def test_beide_pogingen_geblokkeerd(site, monkeypatch):
     )
     with pytest.raises(FetchError) as fout:
         fetch_page(f"{site}/geweigerd")
-    assert "ook met curl_cffi" in fout.value.reason
+    # Elke poging staat met z'n eigen reden in de melding, zodat je ziet
+    # welke manieren geprobeerd zijn.
+    assert "minimale headers" in fout.value.reason
+    assert "volledige headers" in fout.value.reason
+    assert "curl_cffi" in fout.value.reason
 
 
 def test_foto_komt_binnen_met_referer(site):
@@ -225,3 +284,179 @@ def test_fotoheaders_zonder_referer():
     headers = image_headers()
     assert "Referer" not in headers
     assert headers["Accept"].startswith("image/")
+
+
+# ------------------------------------------------- de browser-container
+
+def test_browser_is_de_laatste_redding(site):
+    """
+    Albert Heijn weigert elke server-side aanvraag met 403, ook curl_cffi met
+    TLS-vingerafdruk: Akamai zet z'n sensor-cookies pas nadat het JavaScript
+    op de pagina gedraaid heeft. Dan is een echte browser wat er nog overblijft.
+    """
+    result = fetch_page(f"{site}/geweigerd", renderer_url=site)
+    assert result.via == "browser"
+    assert "Kip korma" in result.html
+
+
+def test_browser_wordt_ook_gebruikt_bij_een_pagina_zonder_schema(site):
+    """
+    Een cookiemuur komt met een nette 200 terug, dus "het kwam door" is niet
+    genoeg: er moet een recept in staan.
+    """
+    assert "application/ld+json" not in RECEPTPAGINA.decode()
+
+    result = fetch_page(f"{site}/ok", renderer_url=site)
+    assert result.via == "browser"
+    assert "application/ld+json" in result.html
+
+
+def test_zonder_browser_container_geen_extra_poging(site):
+    """
+    Zonder browser hebben extra pogingen geen zin: dezelfde server stuurt
+    dezelfde inhoud. Dan houden we wat we hebben.
+    """
+    result = fetch_page(f"{site}/ok", renderer_url="")
+    assert result.via == "requests"
+    assert "application/ld+json" not in result.html
+
+
+def test_een_kapotte_browser_container_laat_de_reden_zien(site):
+    import test_fetcher
+
+    test_fetcher._Handler.render_fout = "Page.goto: net::ERR_TIMED_OUT"
+    with pytest.raises(FetchError) as fout:
+        fetch_page(f"{site}/geweigerd", renderer_url=site)
+    assert "browser" in fout.value.reason
+    assert "ERR_TIMED_OUT" in fout.value.reason
+
+
+def test_browser_container_onbereikbaar(site):
+    """
+    De brug mag niet omvallen als de tweede container uit staat - en de
+    melding moet zeggen wélke van de drie oorzaken het is, want een kale
+    ConnectionError stuurt je de verkeerde kant op.
+    """
+    with pytest.raises(FetchError) as fout:
+        fetch_page(f"{site}/geweigerd", renderer_url="http://127.0.0.1:1")
+    assert "browser-container niet bereikt" in fout.value.reason
+    assert "luistert niet op poort 1" in fout.value.reason
+
+
+def test_verdwenen_pagina_kost_geen_browserronde(site):
+    """Een 404 is definitief; daar helpt geen enkele andere poging aan."""
+    _Handler.ontvangen = []
+    with pytest.raises(FetchError) as fout:
+        fetch_page(f"{site}/verdwenen", renderer_url=site)
+    assert fout.value.status == 404
+    assert not [p for p, _ in _Handler.ontvangen if p == "/render"]
+
+
+# ------------------------------------------- waarom antwoordt de browser niet
+
+def test_diagnose_een_naam_die_niet_bestaat():
+    """
+    Het geval dat je krijgt als de tweede service niet in dezelfde YAML staat.
+    """
+    from fetcher import renderer_diagnose
+
+    uit = renderer_diagnose("http://deze-naam-bestaat-niet-12345:8096")
+    assert uit["ingesteld"] is True
+    assert uit["naam_lost_op"] is False
+    assert "bestaat niet in dit Docker-netwerk" in uit["reden"]
+    assert "dezelfde" in uit["reden"]
+
+
+def test_diagnose_een_dichte_poort():
+    """En dit krijg je als de container er wel is maar niet luistert."""
+    from fetcher import renderer_diagnose
+
+    uit = renderer_diagnose("http://127.0.0.1:1")
+    assert uit["naam_lost_op"] is True
+    assert uit["poort_open"] is False
+    assert "luistert niet op poort 1" in uit["reden"]
+    assert "logboek" in uit["reden"]
+
+
+def test_diagnose_een_draaiende_container(site):
+    from fetcher import renderer_diagnose
+
+    uit = renderer_diagnose(site)
+    assert uit["naam_lost_op"] is True
+    assert uit["poort_open"] is True
+    # /healthz bestaat niet op de testserver, dus gezond is False - maar de
+    # poort staat open, en dat is het verschil dat we willen zien.
+    assert uit["gezond"] is False
+    assert "healthz" in uit["reden"]
+
+
+def test_diagnose_zonder_browser_container():
+    from fetcher import renderer_diagnose
+
+    uit = renderer_diagnose("")
+    assert uit["ingesteld"] is False
+    assert "RENDERER_URL is leeg" in uit["reden"]
+
+
+# -- de AH-route in de rij ------------------------------------------------------
+
+AH_LINK = "https://www.ah.nl/allerhande/recept/R-R1194169/traybake"
+
+
+def _pagina_via_headers(monkeypatch):
+    """Laat de headerpoging slagen, zodat te zien is óf de rij doorloopt."""
+    import fetcher
+
+    gezien = []
+
+    def nep(url, *, timeout, headers=None, naam="requests"):
+        gezien.append(naam)
+        return _Attempt(True, status=200,
+                        result=fetcher.FetchResult(url, url, 200, MET_SCHEMA, naam))
+
+    monkeypatch.setattr(fetcher, "_attempt_requests", nep)
+    monkeypatch.setattr(fetcher, "_attempt_curl", lambda url, *, timeout: None)
+    return gezien
+
+
+@pytest.mark.parametrize("fout", [
+    # Een 404 van api.ah.nl zegt iets over de API, niet over het recept.
+    "ah-404",
+    # Een antwoord waar de code niet op rekende.
+    "onverwacht",
+    # Een recept zonder ingrediënten: Tandoor zou het aanmaken, en dan staat het
+    # er en ziet de brug het bij een nieuwe poging als "bestaat al".
+    "zonder-ingredienten",
+])
+def test_een_mislukte_ah_poging_laat_de_rest_van_de_rij_draaien(monkeypatch, fout):
+    import ah_api
+    import fetcher
+
+    def nep_ah(url, **_):
+        if fout == "ah-404":
+            raise ah_api.AhError("AH gaf status 404", status=404)
+        if fout == "onverwacht":
+            raise KeyError("recipe")
+        return "<html></html>", {"id": 1, "title": "Kaal"}
+
+    monkeypatch.setattr(ah_api, "fetch_page_html", nep_ah)
+    gezien = _pagina_via_headers(monkeypatch)
+
+    pagina = fetch_page(AH_LINK, renderer_url="")
+    assert pagina.via == "requests"
+    assert gezien == ["requests"]
+
+
+def test_met_de_ah_route_uit_wordt_hij_ook_niet_geprobeerd(monkeypatch):
+    import ah_api
+    import fetcher
+
+    monkeypatch.setattr(ah_api, "AH_API_AAN", False)
+    monkeypatch.setattr(ah_api, "fetch_page_html",
+                        lambda *a, **k: pytest.fail("de AH-route staat uit"))
+    _pagina_via_headers(monkeypatch)
+    assert fetch_page(AH_LINK, renderer_url="").via == "requests"
+
+    monkeypatch.setattr(fetcher, "RENDERER_URL", "")
+    [ah] = [p for p in fetcher.probe(AH_LINK) if p["poging"] == "AH-API"]
+    assert ah["ok"] is False and "AH_API=0" in ah["reden"]

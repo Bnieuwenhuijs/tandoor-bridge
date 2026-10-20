@@ -7,17 +7,61 @@ services:
     # en zet in plaats daarvan: build: .
     container_name: tandoor-bridge
     restart: unless-stopped
+    # Haal het image elke start opnieuw op. Zonder dit ziet TrueNAS een
+    # verschoven :latest niet: de Update-knop kijkt naar de app-configuratie,
+    # en die verandert niet als alleen de tag naar een nieuw image wijst.
+    # Keerzijde: start de NAS op terwijl er geen internet is, dan mislukt de
+    # pull en start de container niet. Haal deze regel weg als je dat erger
+    # vindt dan handmatig bijwerken.
+    pull_policy: always
     env_file: .env
     ports:
       # Alleen op het LAN en via Tailscale, niet naar het internet
-      # doorzetten in je router.
-      - "8095:8095"
+      # doorzetten in je router. PORT komt uit .env en geldt aan beide
+      # kanten: anders verzet je alleen de poort binnen de container en is
+      # de brug daarna onbereikbaar.
+      - "${PORT:-8095}:${PORT:-8095}"
     volumes:
       # De geschiedenis moet een herstart en een update overleven.
+      #
+      # Maak deze map zelf aan en geef hem aan de gebruiker uit het image,
+      # vóór de eerste start:
+      #     mkdir -p data && sudo chown -R 10001:10001 data
+      # Laat je dat aan Docker over, dan maakt die hem aan als root en kan de
+      # container er niet in schrijven. De brug zegt dan bij de start wel
+      # precies wat eraan te doen is, maar dit scheelt die ronde.
       - ./data:/data
     logging:
       # Zonder grens groeien de logs van een container die maanden draait
       # door tot ze de schijf vullen.
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Voor Albert Heijn is deze container niet nodig: die recepten gaan via de
+  # app-API van AH (zie de README bij "Albert Heijn: de app-API"). Hij is er
+  # voor andere sites die hun recept pas met JavaScript opbouwen, of die een
+  # blokkade als gewone pagina teruggeven.
+  #
+  # De brug gebruikt hem alleen als de gewone pogingen falen of een pagina
+  # zonder recept opleveren. Haal deze service en RENDERER_URL (in .env) weg
+  # als je hem niet nodig hebt; dan blijft alleen de lichte container over.
+  #
+  # De browser start pas bij het eerste verzoek en sluit zichzelf weer af na
+  # BROWSER_IDLE_SECONDS zonder werk, dus tussen twee importrondes kost dit
+  # geen geheugen.
+  tandoor-bridge-renderer:
+    image: ghcr.io/bnieuwenhuijs/tandoor-bridge-renderer:latest
+    pull_policy: always
+    restart: unless-stopped
+    environment:
+      BROWSER_IDLE_SECONDS: "120"
+      NAV_TIMEOUT_MS: "30000"
+      LOG_LEVEL: "INFO"
+    # Geen ports: alleen de brug praat ermee, binnen het Docker-netwerk. Zet
+    # hem niet open - hij haalt elke URL op die je hem geeft.
+    logging:
       driver: json-file
       options:
         max-size: "10m"

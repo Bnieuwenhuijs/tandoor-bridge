@@ -21,8 +21,14 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from urllib.parse import urljoin
 
-from fetcher import FetchError, fetch_image, fetch_page
-from tandoor import TandoorError, TandoorNoRecipe, TandoorThrottled
+from fetcher import FetchError, FetchResult, fetch_image, fetch_page
+from tandoor import (
+    NoRecipeSchema,
+    TandoorError,
+    TandoorNoRecipe,
+    TandoorThrottled,
+    TandoorUnreachable,
+)
 from urls import dedupe_key, extract_urls, normalize_url
 
 log = logging.getLogger(__name__)
@@ -42,6 +48,10 @@ AFGEROND = (KLAAR, BESTAAT_AL)
 
 # Een limiet die zo vaak terugkomt is geen limiet meer maar een probleem.
 MAX_LIMIET_POGINGEN = 50
+
+# Tandoor die niet antwoordt is meestal tijdelijk: een herstart na een update
+# duurt seconden. Maar niet eindeloos blijven proberen.
+MAX_ONBEREIKBAAR = 5
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS items (
@@ -215,6 +225,30 @@ class Store:
                 result.added.append(cursor.lastrowid)
         return result
 
+    def add_claimed(self, url, *, source="bookmarklet") -> int | None:
+        """
+        Voeg één URL toe die meteen verwerkt wordt, al geclaimd.
+
+        Voor de bookmarklet: die levert de HTML zelf aan en wordt direct
+        afgehandeld. Hem eerst als "wachtend" invoegen zou een race met de
+        worker opleveren - die kan hem dan oppakken en opnieuw gaan ophalen.
+
+        Geeft None als deze URL al geïmporteerd is of al in de rij staat.
+        """
+        beoordeling = self.classify([url])
+        if not beoordeling:
+            return None
+        oordeel = beoordeling[0]
+        if oordeel["state"] in ("al_geimporteerd", "in_wachtrij"):
+            return None
+        schoon = oordeel["url"]
+        with self._connect() as db:
+            cursor = db.execute(
+                "INSERT INTO items (url, dedupe_key, status, attempts, source, "
+                "created_at, updated_at) VALUES (?, ?, ?, 1, ?, ?, ?)",
+                (schoon, dedupe_key(schoon), NAAR_TANDOOR, source, _now(), _now()))
+            return cursor.lastrowid
+
     def add_text(self, text, *, source="web") -> AddResult:
         return self.add(extract_urls(text), source=source)
 
@@ -258,7 +292,7 @@ class Store:
         with self._connect() as db:
             cursor = db.execute(
                 "UPDATE items SET status = ?, error = NULL, note = NULL, "
-                "updated_at = ? WHERE id = ? AND status = ?",
+                "attempts = 0, updated_at = ? WHERE id = ? AND status = ?",
                 (WACHTEND, _now(), item_id, MISLUKT))
             return cursor.rowcount > 0
 
@@ -266,7 +300,8 @@ class Store:
         with self._connect() as db:
             cursor = db.execute(
                 "UPDATE items SET status = ?, error = NULL, note = NULL, "
-                "updated_at = ? WHERE status = ?", (WACHTEND, _now(), MISLUKT))
+                "attempts = 0, updated_at = ? WHERE status = ?",
+                (WACHTEND, _now(), MISLUKT))
             return cursor.rowcount
 
     def find_imported(self, key, *, exclude_id=None) -> dict | None:
@@ -344,7 +379,18 @@ class ImportQueue:
         item = self.store.claim_next()
         if not item:
             return None
+        try:
+            return self._process(item)
+        except Exception as e:
+            # Het item staat op dit moment op 'ophalen' of 'naar_tandoor'.
+            # requeue_stale() draait alleen bij de start, dus zonder deze
+            # vangst blijft het daar staan tot de container herstart - en
+            # verdwijnt het uit de rij zonder dat iemand het ziet.
+            self.store.update(item["id"], status=MISLUKT,
+                              error=f"onverwachte fout: {e.__class__.__name__}: {e}")
+            raise
 
+    def _process(self, item: dict) -> dict:
         item_id, url = item["id"], item["url"]
         log.info("[%s] %s", item_id, url)
 
@@ -363,12 +409,29 @@ class ImportQueue:
             self.store.update(item_id, status=MISLUKT, error=e.reason)
             return {"status": MISLUKT}
 
-        # 3. Tandoor laten ontleden.
         self.store.update(item_id, status=NAAR_TANDOOR)
+        return self._naar_tandoor(item, pagina)
+
+    def _naar_tandoor(self, item: dict, pagina) -> dict:
+        """
+        De helft na het ophalen: laten ontleden, aanmaken, foto erbij.
+
+        Apart van _process() omdat de bookmarklet de HTML zelf aanlevert en
+        dus bij deze stap begint.
+        """
+        item_id, url = item["id"], item["url"]
+
+        # 3. Tandoor laten ontleden.
         try:
             bron = self.client.recipe_from_source(url, pagina.html)
         except TandoorThrottled as e:
             return self._handle_throttle(item, e)
+        except TandoorUnreachable as e:
+            return self._handle_unreachable(item, e)
+        except NoRecipeSchema as e:
+            # Onze eigen voorcontrole; Tandoor heeft deze pagina nooit gezien.
+            self.store.update(item_id, status=MISLUKT, error=e.message)
+            return {"status": MISLUKT}
         except TandoorNoRecipe as e:
             self.store.update(item_id, status=MISLUKT,
                               error=f"Tandoor vond geen recept: {e.message}")
@@ -388,6 +451,14 @@ class ImportQueue:
         # 5. Aanmaken.
         try:
             recept = self.client.create_recipe(bron.recipe, source_url=url)
+        except TandoorThrottled as e:
+            return self._handle_throttle(item, e)
+        except TandoorUnreachable as e:
+            # Let op: het recept kán aangemaakt zijn en alleen het antwoord
+            # verloren. Daarom gaat dit item terug in de rij in plaats van op
+            # mislukt - bij de volgende poging ziet Tandoors duplicates-lijst
+            # het recept en wordt het "bestaat al".
+            return self._handle_unreachable(item, e)
         except TandoorError as e:
             self.store.update(item_id, status=MISLUKT, error=e.message)
             return {"status": MISLUKT}
@@ -404,6 +475,44 @@ class ImportQueue:
         log.info("[%s] klaar: %s (recept %s)", item_id, titel, recipe_id)
         return {"status": KLAAR}
 
+    def process_html(self, url: str, html: str, *, source="bookmarklet") -> dict:
+        """
+        Verwerk HTML die iemand zelf heeft aangeleverd.
+
+        Dit is de route voor sites die geen enkele server-side aanvraag
+        toelaten: jouw browser heeft de cookies en voert het JavaScript uit, en
+        stuurt de pagina die daaruit komt hiernaartoe. Alles ná het ophalen is
+        hetzelfde als bij een gewone import, dus de dubbelcontrole, de
+        bron-URL, de foto en de geschiedenis werken precies zo.
+        """
+        schoon = normalize_url(url or "")
+        if not schoon:
+            return {"status": MISLUKT, "error": "geen geldige URL meegestuurd"}
+        if not (html or "").strip():
+            return {"status": MISLUKT, "error": "geen HTML meegestuurd"}
+
+        eerder = self.store.find_imported(dedupe_key(schoon))
+        if eerder:
+            return {"status": BESTAAT_AL, "item_id": eerder["id"],
+                    "titel": eerder["title"], "recipe_id": eerder["recipe_id"]}
+
+        item_id = self.store.add_claimed(schoon, source=source)
+        if item_id is None:
+            return {"status": BESTAAT_AL, "error": "staat al in de wachtrij"}
+
+        item = self.store.item(item_id)
+        pagina = FetchResult(schoon, schoon, 200, html, source)
+        try:
+            uitkomst = self._naar_tandoor(item, pagina)
+        except Exception as e:
+            self.store.update(item_id, status=MISLUKT,
+                              error=f"onverwachte fout: {e.__class__.__name__}: {e}")
+            raise
+        ververst = self.store.item(item_id)
+        return {**uitkomst, "item_id": item_id, "titel": ververst["title"],
+                "recipe_id": ververst["recipe_id"], "error": ververst["error"],
+                "note": ververst["note"]}
+
     def _handle_throttle(self, item, fout: TandoorThrottled) -> dict:
         """Terug in de rij, en wachten tot de limiet weer ruimte geeft."""
         if item["attempts"] >= MAX_LIMIET_POGINGEN:
@@ -415,6 +524,18 @@ class ImportQueue:
                                f"({fout.retry_after} s)")
         log.warning("importlimiet bereikt; %s seconden wachten", fout.retry_after)
         return {"status": WACHTEND, "wait": fout.retry_after}
+
+    def _handle_unreachable(self, item, fout: TandoorUnreachable) -> dict:
+        """Tandoor antwoordde niet; terug in de rij, want dat is vaak tijdelijk."""
+        if item["attempts"] >= MAX_ONBEREIKBAAR:
+            self.store.update(item["id"], status=MISLUKT, error=fout.message)
+            return {"status": MISLUKT}
+        self.store.update(
+            item["id"], status=WACHTEND,
+            note=f"Tandoor antwoordde niet; poging {item['attempts']} van "
+                 f"{MAX_ONBEREIKBAAR}")
+        log.warning("Tandoor antwoordde niet voor item %s: %s", item["id"], fout.message)
+        return {"status": WACHTEND, "wait": min(60, 5 * max(1, item["attempts"]))}
 
     def _attach_photo(self, recipe_id, bron, pagina) -> str | None:
         foto_url = bron.recipe.get("image_url") or (bron.images[0] if bron.images else None)
