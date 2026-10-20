@@ -21,7 +21,7 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py ah_api.py fetcher.py importqueue.py tandoor.py urls.py ./
-COPY mock_tandoor.py mock_ah.py smoketest.py ./
+COPY mock_tandoor.py mock_opslag.py mock_ah.py smoketest.py ./
 COPY templates/ ./templates/
 
 # Deze lijst is met de hand bijgehouden en is al twee keer achtergebleven bij

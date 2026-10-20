@@ -28,10 +28,12 @@ aan - dat is precies het punt.
 """
 
 import argparse
+import copy
 import json
 import re
 from urllib.parse import unquote, urljoin
 
+from mock_opslag import Fout, Opslag
 from flask import Flask, jsonify, request
 
 # Zoals cookbook/helper/image_processing.py, image_only=True.
@@ -57,10 +59,25 @@ _BREUKEN = {"½": 0.5, "⅓": 1 / 3, "⅔": 2 / 3, "¼": 0.25, "¾": 0.75}
 class State:
     """Alles wat de nepserver onthoudt. Eén instantie per app."""
 
-    def __init__(self, *, token_prefix="tda_", throttle_after=0, retry_after=5):
-        self.recipes = {}
-        self.next_id = 1
+    def __init__(self, *, token_prefix="tda_", throttle_after=0, retry_after=5,
+                 ai_providers=None, ai_default_provider=None, ai_enabled=True,
+                 ai_tegoed=None, ai_gedrag="volgens-tekst", ai_limiet=0):
+        self.opslag = Opslag()
         self.token_prefix = token_prefix
+        # De AI-kant. ai_tegoed=None is onbeperkt; ai_limiet=0 is geen limiet.
+        self.ai_providers = list(ai_providers if ai_providers is not None
+                                 else [{"id": 1, "name": "Mock-AI", "model_name": "mock"}])
+        self.ai_default_provider = ai_default_provider
+        self.ai_enabled = ai_enabled
+        self.ai_tegoed = ai_tegoed
+        self.ai_gedrag = ai_gedrag
+        self.ai_limiet = ai_limiet
+        self.ai_calls = 0
+        # AiEndpointThrottle en RecipeImportThrottle zijn allebei een
+        # UserRateThrottle zonder eigen scope, dus allebei de cachesleutel
+        # throttle_user_<id>: één geschiedenis voor twee limieten. Dit is die
+        # geschiedenis, als teller.
+        self.gedeelde_teller = 0
         self.throttle_after = throttle_after
         self.retry_after = retry_after
         self.import_calls = 0
@@ -68,11 +85,17 @@ class State:
         self.last_data_raw = None
         self.images = {}
 
+    @property
+    def recipes(self):
+        """Voor wie de recepten als woordenboeken wil, zoals vroeger."""
+        return {rid: self.opslag.recept(rid) for rid in self.opslag.recepten}
+
     def reset(self):
-        self.recipes.clear()
+        self.opslag.reset()
         self.images.clear()
-        self.next_id = 1
         self.import_calls = 0
+        self.ai_calls = 0
+        self.gedeelde_teller = 0
         self.last_data_decoded = None
         self.last_data_raw = None
 
@@ -248,10 +271,88 @@ def _from_source_response(**velden):
     return antwoord
 
 
-def create_app(*, throttle_after=0, retry_after=5, token_prefix="tda_"):
+def _ai_sortering(recept, gedrag, opslag):
+    """
+    Wat de nagebootste AI van een recept maakt.
+
+    Standaard ("volgens-tekst") zet hij elk ingrediënt in de eerste stap
+    waarin de naam van de food voorkomt, en anders in de eerste stap. Met de
+    andere waarden van gedrag doet hij wat een taalmodel ook echt kan doen:
+
+      splitsen            een stap met meer zinnen wordt een stap per zin; de
+                          nieuwe stappen hebben geen id
+      splitsen-zelfde-id  idem, maar met het id van de oorspronkelijke stap
+                          op álle stukken - gekopieerd, zoals een model dat doet
+      dubbel              het eerste ingrediënt staat in twee stappen
+      weglaten            het laatste ingrediënt verdwijnt
+      zonder-ids          geen enkel id meer, alleen de inhoud
+      vreemd-id           één ingrediënt krijgt het id van een ingrediënt uit
+                          een ander recept
+      ander-bedrag        de hoeveelheid en de naam van het eerste ingrediënt
+                          veranderen
+      inpakken            het antwoord komt als {"recipe": {...}}
+    """
+    r = copy.deepcopy(recept)
+    stappen = [s for s in (r.get("steps") or []) if isinstance(s, dict)]
+    if not stappen:
+        return r
+    if gedrag in ("splitsen", "splitsen-zelfde-id"):
+        nieuw = []
+        for stap in stappen:
+            zinnen = [z.strip() for z in re.split(r"(?<=[.!?])\s+", stap.get("instruction") or "")
+                      if z.strip()]
+            if len(zinnen) <= 1:
+                nieuw.append(stap)
+                continue
+            for k, zin in enumerate(zinnen):
+                stuk = {**stap, "instruction": zin,
+                        "ingredients": stap.get("ingredients") if k == 0 else []}
+                if k and gedrag == "splitsen":
+                    stuk.pop("id", None)
+                nieuw.append(stuk)
+        stappen = nieuw
+    alle = [i for stap in stappen for i in (stap.get("ingredients") or [])]
+    for stap in stappen:
+        stap["ingredients"] = []
+    for ingredient in alle:
+        naam = ((ingredient.get("food") or {}).get("name") or "").strip().lower()
+        doel = next((stap for stap in stappen
+                     if naam and naam in (stap.get("instruction") or "").lower()), stappen[0])
+        doel["ingredients"].append(ingredient)
+    if gedrag == "dubbel" and alle and len(stappen) > 1:
+        tweede = next(stap for stap in stappen if alle[0] not in stap["ingredients"])
+        tweede["ingredients"].append(copy.deepcopy(alle[0]))
+    if gedrag == "weglaten" and alle:
+        for stap in stappen:
+            if alle[-1] in stap["ingredients"]:
+                stap["ingredients"].remove(alle[-1])
+    if gedrag == "zonder-ids":
+        for stap in stappen:
+            stap.pop("id", None)
+            for ingredient in stap["ingredients"]:
+                ingredient.pop("id", None)
+    if gedrag == "vreemd-id" and alle:
+        eigen = {i.get("id") for i in alle}
+        vreemd = next((iid for iid in sorted(opslag.ingredienten, reverse=True)
+                       if iid not in eigen), None)
+        if vreemd is not None:
+            alle[0]["id"] = vreemd
+    if gedrag == "ander-bedrag" and alle:
+        alle[0]["amount"] = (alle[0].get("amount") or 1) * 10
+        if isinstance(alle[0].get("food"), dict):
+            alle[0]["food"] = {**alle[0]["food"], "name": "iets anders"}
+    r["steps"] = stappen
+    return r
+
+
+def create_app(*, throttle_after=0, retry_after=5, token_prefix="tda_", **ai):
+    """
+    ai: ai_providers, ai_default_provider, ai_enabled, ai_tegoed, ai_gedrag en
+    ai_limiet - zie State. Tijdens een test te veranderen via POST /__mock/ai.
+    """
     app = Flask(__name__)
     state = State(throttle_after=throttle_after, retry_after=retry_after,
-                  token_prefix=token_prefix)
+                  token_prefix=token_prefix, **ai)
     app.state = state
 
     def auth_fout():
@@ -290,6 +391,7 @@ def create_app(*, throttle_after=0, retry_after=5, token_prefix="tda_"):
             antwoord.status_code = 429
             antwoord.headers["Retry-After"] = str(state.retry_after)
             return antwoord
+        state.gedeelde_teller += 1
 
         body = request.get_json(silent=True) or {}
         url = (body.get("url") or "").strip()
@@ -346,7 +448,7 @@ def create_app(*, throttle_after=0, retry_after=5, token_prefix="tda_"):
         if url:
             duplicates = [
                 {"id": r["id"], "name": r["name"]}
-                for r in state.recipes.values()
+                for r in state.opslag.recepten.values()
                 if (r.get("source_url") or "") == url
             ]
 
@@ -370,48 +472,51 @@ def create_app(*, throttle_after=0, retry_after=5, token_prefix="tda_"):
 
         # Ingredient.order is IntegerField(default=0), ook niet nullable,
         # terwijl het antwoord van recipe-from-source er altijd null in zet.
-        # Dit is de 400 die je krijgt als je dat antwoord onbewerkt terugpost.
-        for stap in body.get("steps") or []:
-            for ingredient in (stap or {}).get("ingredients") or []:
-                if "order" in ingredient and ingredient["order"] is None:
-                    return jsonify({"steps": [{"ingredients": [
-                        {"order": ["This field may not be null."]}]}]}), 400
-
-        recept = {sleutel: waarde for sleutel, waarde in body.items()
-                  if sleutel not in ("id", "image", "created_by", "created_at",
-                                     "food_properties", "image_url")}
-        recept["id"] = state.next_id
-        recept["image"] = None
-        recept.setdefault("source_url", "")
-        state.recipes[state.next_id] = recept
-        state.next_id += 1
-        return jsonify(recept), 201
+        # Die 400 komt uit de opslag (mock_opslag.py), net als bij Tandoor uit
+        # de geneste serializer.
+        try:
+            recept_id = state.opslag.maak_recept(body)
+        except Fout as e:
+            return jsonify(e.body), e.status
+        return jsonify(state.opslag.recept(recept_id)), 201
 
     @app.get("/api/recipe/")
     def list_recipes():
-        recepten = list(state.recipes.values())
-        return jsonify({"count": len(recepten), "next": None, "previous": None,
-                        "results": recepten[:int(request.args.get("page_size", 25))]}), 200
+        # RecipePagination: standaard 25, hooguit 100 per pagina.
+        try:
+            grootte = min(max(int(request.args.get("page_size", 25)), 1), 100)
+            pagina = max(int(request.args.get("page", 1)), 1)
+        except ValueError:
+            return jsonify({"detail": "Invalid page."}), 404
+        ids = sorted(state.opslag.recepten)
+        stuk = ids[(pagina - 1) * grootte: pagina * grootte]
+        if not stuk and pagina > 1:
+            return jsonify({"detail": "Invalid page."}), 404
+        volgende = None
+        if pagina * grootte < len(ids):
+            volgende = f"{request.base_url}?page={pagina + 1}&page_size={grootte}"
+        return jsonify({"count": len(ids), "next": volgende, "previous": None,
+                        "results": [state.opslag.overzicht(i) for i in stuk]}), 200
 
     @app.get("/api/recipe/<int:recipe_id>/")
     def get_recipe(recipe_id):
-        if recipe_id not in state.recipes:
+        if recipe_id not in state.opslag.recepten:
             return jsonify({"detail": "No Recipe matches the given query."}), 404
-        return jsonify(state.recipes[recipe_id]), 200
+        return jsonify(state.opslag.recept(recipe_id)), 200
 
     @app.patch("/api/recipe/<int:recipe_id>/")
     def patch_recipe(recipe_id):
-        if recipe_id not in state.recipes:
+        if recipe_id not in state.opslag.recepten:
             return jsonify({"detail": "No Recipe matches the given query."}), 404
         body = request.get_json(silent=True) or {}
-        for sleutel, waarde in body.items():
-            if sleutel not in ("id", "image", "created_by", "created_at"):
-                state.recipes[recipe_id][sleutel] = waarde
-        return jsonify(state.recipes[recipe_id]), 200
+        try:
+            return jsonify(state.opslag.werk_bij(recipe_id, body, partial=True)), 200
+        except Fout as e:
+            return jsonify(e.body), e.status
 
     @app.put("/api/recipe/<int:recipe_id>/image/")
     def set_image(recipe_id):
-        if recipe_id not in state.recipes:
+        if recipe_id not in state.opslag.recepten:
             return jsonify({"detail": "No Recipe matches the given query."}), 404
 
         # parser_classes=[MultiPartParser]: een JSON-body komt hier niet in.
@@ -437,15 +542,121 @@ def create_app(*, throttle_after=0, retry_after=5, token_prefix="tda_"):
             return jsonify({"detail": "A server error occurred."}), 500
 
         state.images[recipe_id] = (bestand.filename, bestand.read())
-        state.recipes[recipe_id]["image"] = f"/media/recipes/{recipe_id}{naam[naam.rfind('.'):]}"
-        return jsonify(state.recipes[recipe_id]), 200
+        state.opslag.zet_afbeelding(recipe_id, f"/media/recipes/{recipe_id}{naam[naam.rfind('.'):]}")
+        return jsonify(state.opslag.recept(recipe_id)), 200
+
+    # ------------------------------------------------ AI
+
+    def _provider_uit(provider):
+        # AiProviderSerializer: api_key is write_only en komt nooit terug.
+        return {"id": provider["id"], "name": provider.get("name", ""),
+                "description": provider.get("description", ""),
+                "model_name": provider.get("model_name", ""), "url": provider.get("url"),
+                "log_credit_cost": True, "space": provider.get("space", 1),
+                "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"}
+
+    def _kan_ai():
+        """can_perform_ai_request() uit cookbook/helper/ai_helper.py."""
+        return state.ai_enabled and (state.ai_tegoed is None or state.ai_tegoed > 0)
+
+    @app.get("/api/space/current/")
+    def space_current():
+        standaard = next((p for p in state.ai_providers
+                          if p["id"] == state.ai_default_provider), None)
+        return jsonify({
+            "id": 1, "name": "Thuis", "ai_enabled": state.ai_enabled,
+            "ai_credits_monthly": 0,
+            "ai_credits_balance": 1000 if state.ai_tegoed is None else state.ai_tegoed,
+            "ai_monthly_credits_used": 0,
+            "ai_default_provider": _provider_uit(standaard) if standaard else None,
+        }), 200
+
+    @app.get("/api/ai-provider/")
+    def ai_providers():
+        return jsonify({"count": len(state.ai_providers), "next": None, "previous": None,
+                        "results": [_provider_uit(p) for p in state.ai_providers]}), 200
+
+    @app.post("/api/ai-step-sort/")
+    def ai_step_sort():
+        # De volgorde van AiStepSortView.post: eerst de throttle (die telt een
+        # toegelaten aanvraag mee, ook als er daarna een 400 volgt), dan de
+        # serializer, dan provider, dan tegoed, en pas dan het model.
+        if state.ai_limiet and state.gedeelde_teller >= state.ai_limiet:
+            antwoord = jsonify({"detail": f"Request was throttled. Expected available "
+                                          f"in {state.retry_after} seconds."})
+            antwoord.status_code = 429
+            antwoord.headers["Retry-After"] = str(state.retry_after)
+            return antwoord
+        state.gedeelde_teller += 1
+
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict):
+            return jsonify({"non_field_errors": ["Invalid data."]}), 400
+        # RecipeSerializer(partial=True): dezelfde nulls die create weigert.
+        if "servings" in body and body["servings"] is None:
+            return jsonify({"servings": ["This field may not be null."]}), 400
+        for stap in body.get("steps") or []:
+            for ingredient in (stap or {}).get("ingredients") or []:
+                if isinstance(ingredient, dict) and "order" in ingredient \
+                        and ingredient["order"] is None:
+                    return jsonify({"steps": [{"ingredients": [
+                        {"order": ["This field may not be null."]}]}]}), 400
+
+        provider = request.args.get("provider", "")
+        if not provider.isdigit():
+            return jsonify({"error": True, "msg": "You must select an AI provider "
+                                                  "to perform your request."}), 400
+        if not _kan_ai():
+            return jsonify({"error": True, "msg": "You don't have any credits remaining "
+                                                  "to use AI or AI features are not "
+                                                  "enabled for your space."}), 400
+        if not any(p["id"] == int(provider) for p in state.ai_providers):
+            # De view zoekt de provider op met .first() en gebruikt hem
+            # ongecontroleerd: None.api_key, en dat wordt de algemene 500.
+            return jsonify({"error": True, "msg": "An unexpected error occurred while "
+                                                  "processing your AI request. \n\n"
+                                                  "'NoneType' object has no attribute "
+                                                  "'api_key'"}), 500
+
+        gedrag = state.ai_gedrag
+        if gedrag == "fout":
+            return jsonify({"error": True, "msg": "The AI could not process your "
+                                                  "request. \n\nRequest timed out"}), 400
+        if gedrag == "kapot":
+            return jsonify({"error": True, "msg": "An unexpected error occurred while "
+                                                  "processing your AI request. \n\n"
+                                                  "Expecting value: line 1 column 1"}), 500
+        state.ai_calls += 1
+        if state.ai_tegoed is not None:
+            state.ai_tegoed -= 1
+        # Het antwoord van het model gaat ongecontroleerd terug: in de view
+        # staat "# TODO validate by loading/dumping using serializer ?".
+        resultaat = _ai_sortering(body, gedrag, state.opslag)
+        if gedrag == "inpakken":
+            resultaat = {"recipe": resultaat}
+        return jsonify(resultaat), 200
+
+    @app.post("/__mock/ai")
+    def mock_ai():
+        """Verander het AI-gedrag midden in een test."""
+        body = request.get_json(silent=True) or {}
+        for sleutel in ("ai_gedrag", "ai_tegoed", "ai_enabled", "ai_limiet",
+                        "ai_default_provider", "ai_providers"):
+            if sleutel in body:
+                setattr(state, sleutel, body[sleutel])
+        if body.get("teller_terug"):
+            state.gedeelde_teller = 0
+        return jsonify({"ok": True}), 200
 
     # ------------------------------------------------ inkijk voor tests
 
     @app.get("/__mock/state")
     def mock_state():
         return jsonify({
-            "recipes": list(state.recipes.values()),
+            "recipes": [state.opslag.recept(i) for i in sorted(state.opslag.recepten)],
+            "tellingen": state.opslag.tellingen(),
+            "ai_calls": state.ai_calls,
+            "ai_tegoed": state.ai_tegoed,
             "import_calls": state.import_calls,
             "images": {str(k): v[0] for k, v in state.images.items()},
             "last_data_decoded": state.last_data_decoded,
