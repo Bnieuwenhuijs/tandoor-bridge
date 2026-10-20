@@ -20,7 +20,7 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py ah_api.py fetcher.py importqueue.py sorteren.py tandoor.py urls.py ./
+COPY app.py ah_api.py fetcher.py importqueue.py sorteerronde.py sorteren.py tandoor.py urls.py ./
 COPY mock_tandoor.py mock_opslag.py mock_ah.py smoketest.py ./
 COPY templates/ ./templates/
 
