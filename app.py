@@ -78,6 +78,10 @@ def config_from_env() -> dict:
         "delay": max(0.0, _env_getal("IMPORT_DELAY_SECONDS", 5.0, float)),
         "port": _env_getal("PORT", 8095, int),
         "send_properties": _env_bool("SEND_PROPERTIES", False),
+        # Leeg: de standaardprovider van de space, of de enige die er is.
+        "ai_provider_id": os.environ.get("TANDOOR_AI_PROVIDER_ID", "").strip(),
+        "ai_sort_imports": _env_bool("AI_SORT_IMPORTS", True),
+        "ai_ratelimit": os.environ.get("AI_RATELIMIT", "60/hour").strip() or "60/hour",
     }
 
 
@@ -148,7 +152,12 @@ def create_app(*, store=None, client=None, queue=None, start_worker=True,
     if store is None:
         store = Store(_schrijfbare_datamap(instellingen["data_dir"]) / "bridge.sqlite3")
     if queue is None:
-        queue = ImportQueue(store, client, delay=instellingen["delay"])
+        sorteerder = None
+        if instellingen.get("ai_sort_imports", True):
+            from sorteren import Sorteerder
+
+            sorteerder = Sorteerder(client, provider_id=instellingen.get("ai_provider_id", ""))
+        queue = ImportQueue(store, client, delay=instellingen["delay"], sorteerder=sorteerder)
 
     app = Flask(__name__)
     app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024

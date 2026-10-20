@@ -28,6 +28,7 @@ from tandoor import (
     TandoorNoRecipe,
     TandoorThrottled,
     TandoorUnreachable,
+    recipe_payload,
 )
 from urls import dedupe_key, extract_urls, normalize_url
 
@@ -324,9 +325,12 @@ class ImportQueue:
     """
 
     def __init__(self, store: Store, client, *, delay=5.0,
-                 fetch=fetch_page, fetch_photo=fetch_image, impersonate=True):
+                 fetch=fetch_page, fetch_photo=fetch_image, impersonate=True,
+                 sorteerder=None):
         self.store = store
         self.client = client
+        # Tandoors AI-sortering voor nieuwe recepten; None is uit.
+        self.sorteerder = sorteerder
         self.delay = float(delay)
         self._fetch = fetch
         self._fetch_photo = fetch_photo
@@ -448,9 +452,34 @@ class ImportQueue:
                               note="stond al in Tandoor")
             return {"status": BESTAAT_AL, "wait": 0}
 
-        # 5. Aanmaken.
+        # 5. Sorteren: Tandoors AI verdeelt de ingrediënten over de stappen.
+        #    Mislukt dat - een fout, een time-out, de limiet, het tegoed - dan
+        #    wordt het recept gewoon ongesorteerd aangemaakt, met de reden erbij.
+        notities = []
+        te_maken = bron.recipe
+        if self.sorteerder is not None:
+            gesorteerd, reden = self.sorteerder.sorteer_nieuw(recipe_payload(
+                bron.recipe, url, send_properties=getattr(self.client, "send_properties", False)))
+            if gesorteerd is not None:
+                te_maken = gesorteerd
+            elif reden:
+                notities.append(f"ongesorteerd: {reden}")
+
+        # 6. Aanmaken.
         try:
-            recept = self.client.create_recipe(bron.recipe, source_url=url)
+            try:
+                recept = self.client.create_recipe(te_maken, source_url=url)
+            except TandoorError as e:
+                # Een 400 op het AI-resultaat betekent dat Tandoor het niet
+                # aanneemt; er is dan niets aangemaakt. Dan het recept zoals
+                # Tandoor het zelf ontleedde. Een 429 of een onbereikbare
+                # Tandoor gaan wel naar de afhandeling hieronder: bij die laatste
+                # kan het recept er al staan.
+                if te_maken is bron.recipe or e.status != 400:
+                    raise
+                log.warning("[%s] Tandoor weigerde het AI-resultaat: %s", item_id, e.message)
+                notities.append(f"ongesorteerd: Tandoor weigerde het AI-resultaat ({e.message})")
+                recept = self.client.create_recipe(bron.recipe, source_url=url)
         except TandoorThrottled as e:
             return self._handle_throttle(item, e)
         except TandoorUnreachable as e:
@@ -466,9 +495,11 @@ class ImportQueue:
         recipe_id = recept.get("id")
         titel = recept.get("name") or bron.recipe.get("name")
 
-        # 6. Foto. Een recept zonder foto is nog steeds een goed recept, dus
+        # 7. Foto. Een recept zonder foto is nog steeds een goed recept, dus
         #    een mislukte foto is een aantekening en geen mislukking.
-        note = self._attach_photo(recipe_id, bron, pagina)
+        if foto := self._attach_photo(recipe_id, bron, pagina):
+            notities.append(foto)
+        note = "; ".join(notities) or None
 
         self.store.update(item_id, status=KLAAR, title=titel,
                           recipe_id=recipe_id, note=note, error=None)

@@ -41,6 +41,7 @@ details uit de broncode; kort:
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import asdict, dataclass, field
 
 from tandoor import (TandoorAiCredits, TandoorAiError, TandoorClient, TandoorError,
@@ -423,3 +424,46 @@ def sorteer_nieuw(client: TandoorClient, provider_id: int, recept: dict):
     if not isinstance(gesorteerd, dict) or not _stappen(gesorteerd):
         return None, "de AI gaf geen stappen terug"
     return gesorteerd, None
+
+
+# -- bij het importeren ----------------------------------------------------
+
+class Sorteerder:
+    """
+    Sorteren tijdens het importeren: aan of uit, en met welke provider.
+
+    De provider wordt pas opgezocht als hij nodig is, en een kwartier
+    onthouden. Zo zet een Tandoor die bij de start van de brug nog niet
+    antwoordt het sorteren niet voorgoed uit, en kost niet elk recept twee
+    extra aanvragen.
+    """
+
+    def __init__(self, client: TandoorClient, *, provider_id: str = "", aan: bool = True,
+                 geldig: float = 900, klok=None):
+        self.client = client
+        self.ingesteld = provider_id
+        self.aan = aan
+        self._geldig = geldig
+        self._klok = klok or time.monotonic
+        self._provider: Provider | None = None
+        self._sinds = 0.0
+
+    def provider(self, *, vers: bool = False) -> Provider:
+        if vers or self._provider is None or self._klok() - self._sinds > self._geldig:
+            self._provider = kies_provider(self.client, self.ingesteld)
+            self._sinds = self._klok()
+            if self._provider.id is None:
+                log.warning("AI-sorteren niet mogelijk: %s", self._provider.uitleg)
+            else:
+                log.info("AI-sorteren met provider %s (%s): %s", self._provider.id,
+                         self._provider.naam, self._provider.uitleg)
+        return self._provider
+
+    def sorteer_nieuw(self, recept: dict):
+        """(gesorteerd, None), (None, reden), of (None, None) als het uitstaat."""
+        if not self.aan:
+            return None, None
+        provider = self.provider()
+        if provider.id is None:
+            return None, provider.uitleg
+        return sorteer_nieuw(self.client, provider.id, recept)

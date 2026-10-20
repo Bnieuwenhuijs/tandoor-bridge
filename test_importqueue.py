@@ -382,3 +382,88 @@ def test_een_kapotte_client_maakt_de_worker_niet_dood(store):
         assert queue.running is True
     finally:
         queue.stop()
+
+
+# ------------------------------------------------------------- sorteren bij importeren
+
+def _rij_met_sorteren(store, client, **sorteerder_opties):
+    from sorteren import Sorteerder
+
+    return ImportQueue(store, client, delay=0, fetch=maak_fetch(),
+                       fetch_photo=maak_fotofetch(),
+                       sorteerder=Sorteerder(client, **sorteerder_opties))
+
+
+def _ai(tandoor, **instelling):
+    import requests
+
+    requests.post(f"{tandoor.url}/__mock/ai", json=instelling)
+
+
+def test_een_nieuw_recept_wordt_gesorteerd_aangemaakt(store, client, tandoor):
+    rij = _rij_met_sorteren(store, client)
+    [item_id] = store.add([AH_URL]).added
+    assert rij.process_once()["status"] == KLAAR
+
+    recept = tandoor.state()["recipes"][0]
+    verdeeld = [s for s in recept["steps"] if s["ingredients"]]
+    assert len(verdeeld) > 1, "alle ingrediënten staan nog in één stap"
+    # Niets kwijt: dezelfde zeven ingrediënten als zonder sorteren.
+    assert sum(len(s["ingredients"]) for s in recept["steps"]) == 7
+    assert store.item(item_id)["note"] is None
+    assert tandoor.state()["ai_calls"] == 1
+
+
+@pytest.mark.parametrize("instelling, reden", [
+    ({"ai_tegoed": 0}, "tegoed van de space is op"),
+    ({"ai_gedrag": "fout"}, "could not process"),
+    ({"ai_gedrag": "kapot"}, "interne fout"),
+    # De limiet is gedeeld met de import zelf: recipe-from-source telt al mee.
+    ({"ai_limiet": 1}, "AI-limiet bereikt"),
+])
+def test_mislukt_de_ai_dan_ongesorteerd_met_de_reden(store, client, tandoor, instelling, reden):
+    _ai(tandoor, **instelling)
+    rij = _rij_met_sorteren(store, client)
+    [item_id] = store.add([AH_URL]).added
+    assert rij.process_once()["status"] == KLAAR
+
+    recept = tandoor.state()["recipes"][0]
+    assert [len(s["ingredients"]) for s in recept["steps"]][0] == 7
+    notitie = store.item(item_id)["note"]
+    assert notitie.startswith("ongesorteerd: ") and reden in notitie
+
+
+def test_weigert_tandoor_het_ai_resultaat_dan_ongesorteerd(store, client, tandoor):
+    class Kapot:
+        def sorteer_nieuw(self, recept):
+            # Een model dat de naam kwijtraakt: daar geeft Tandoor een 400 op,
+            # en daar valt met opschonen niets aan te doen.
+            return {**recept, "name": ""}, None
+
+    rij = ImportQueue(store, client, delay=0, fetch=maak_fetch(),
+                      fetch_photo=maak_fotofetch(), sorteerder=Kapot())
+    [item_id] = store.add([AH_URL]).added
+    assert rij.process_once()["status"] == KLAAR
+    assert len(tandoor.state()["recipes"]) == 1          # één recept, niet twee
+    assert "Tandoor weigerde het AI-resultaat" in store.item(item_id)["note"]
+
+
+def test_zonder_bruikbare_provider_ongesorteerd_met_uitleg(store, client, tandoor):
+    _ai(tandoor, ai_providers=[{"id": 1, "name": "A"}, {"id": 2, "name": "B"}])
+    rij = _rij_met_sorteren(store, client)
+    [item_id] = store.add([AH_URL]).added
+    assert rij.process_once()["status"] == KLAAR
+    assert "TANDOOR_AI_PROVIDER_ID" in store.item(item_id)["note"]
+    assert tandoor.state()["ai_calls"] == 0
+
+
+def test_een_mislukte_foto_en_ongesorteerd_staan_allebei_in_de_notitie(store, client, tandoor):
+    from sorteren import Sorteerder
+
+    _ai(tandoor, ai_tegoed=0)
+    rij = ImportQueue(store, client, delay=0, fetch=maak_fetch(),
+                      fetch_photo=maak_fotofetch(fout="404"), sorteerder=Sorteerder(client))
+    [item_id] = store.add([AH_URL]).added
+    rij.process_once()
+    notitie = store.item(item_id)["note"]
+    assert "ongesorteerd" in notitie and "foto mislukte" in notitie
