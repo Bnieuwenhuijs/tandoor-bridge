@@ -268,6 +268,20 @@ class NoRecipeSchema(TandoorNoRecipe):
     """
 
 
+class TandoorAiError(TandoorError):
+    """De AI-aanroep zelf mislukte: een fout, een time-out, het model."""
+
+
+class TandoorAiCredits(TandoorAiError):
+    """
+    Het AI-tegoed van de space is op, of AI staat voor de space uit.
+
+    Apart, omdat dit geen fout van dit ene recept is: elk volgend recept
+    krijgt dezelfde 400. Een sorteerronde stopt hierop in plaats van door te
+    gaan en honderd keer dezelfde melding te verzamelen.
+    """
+
+
 class TandoorThrottled(TandoorError):
     """De importlimiet is bereikt; na retry_after seconden mag het weer."""
 
@@ -321,6 +335,20 @@ def _message_from(payload: dict, status: int) -> str:
     if velden:
         return "; ".join(velden[:3])
     return f"Tandoor gaf status {status}"
+
+
+def _is_tegoed_op(payload) -> bool:
+    """
+    De 400 uit AiStepSortView als can_perform_ai_request() nee zegt.
+
+    Op de tekst, want er is geen foutcode. Die tekst staat in Tandoor achter
+    gettext; de Nederlandse vertaling is leeg, dus ook een Nederlandstalige
+    Tandoor stuurt het Engels. De aanroeper controleert daarna nog via de
+    space (sorteren.tegoed_op), zodat een andere taal hier niet tot een
+    eindeloze rij mislukte recepten leidt.
+    """
+    melding = str((payload or {}).get("msg") or "").lower()
+    return "credits remaining" in melding or "ai features are not enabled" in melding
 
 
 def _geen_schema_melding(beschrijving: dict) -> str:
@@ -380,7 +408,7 @@ class TandoorClient:
     # -- laag niveau ------------------------------------------------------
 
     def _request(self, method: str, path: str, *, json=None, files=None,
-                 ok=(200, 201), retry: bool = True) -> dict:
+                 ok=(200, 201), retry: bool = True, timeout=None) -> dict:
         """
         retry=False voor aanroepen die niet veilig te herhalen zijn.
 
@@ -402,7 +430,7 @@ class TandoorClient:
         for poging in range(1, max_pogingen + 1):
             try:
                 resp = self._session.request(method, url, json=json, files=files,
-                                             timeout=self._timeout)
+                                             timeout=timeout or self._timeout)
             except requests.RequestException as e:
                 laatste = TandoorUnreachable(
                     f"Tandoor is niet te bereiken op {self.base_url} ({e.__class__.__name__})"
@@ -553,6 +581,76 @@ class TandoorClient:
         )
 
     # -- hulpmiddelen -----------------------------------------------------
+
+    # -- bestaande recepten -----------------------------------------------
+
+    def get_recipe(self, recipe_id: int) -> dict:
+        return self._request("GET", f"/api/recipe/{recipe_id}/", ok=(200,))
+
+    def recipe_ids(self) -> list:
+        """(id, naam) van alle recepten in de space, in pagina's van 100."""
+        recepten, pagina = [], 1
+        while True:
+            antwoord = self._request("GET", f"/api/recipe/?page={pagina}&page_size=100",
+                                     ok=(200,))
+            for recept in antwoord.get("results") or []:
+                if isinstance(recept, dict) and isinstance(recept.get("id"), int):
+                    recepten.append((recept["id"], recept.get("name") or ""))
+            if not antwoord.get("next"):
+                return recepten
+            pagina += 1
+
+    def patch_steps(self, recipe_id: int, steps: list, *, retry: bool) -> dict:
+        """
+        PATCH alleen de stappen van een recept. Zie sorteren.py voor wat je
+        daarin wel en niet kunt sturen.
+
+        retry=False zodra er nieuwe stappen in zitten: die maakt Tandoor bij
+        elke poging opnieuw aan.
+        """
+        return self._request("PATCH", f"/api/recipe/{recipe_id}/", json={"steps": steps},
+                             ok=(200,), retry=retry)
+
+    # -- AI ---------------------------------------------------------------
+
+    def current_space(self) -> dict:
+        return self._request("GET", "/api/space/current/", ok=(200,))
+
+    def ai_providers(self) -> list:
+        """De AI-providers die deze gebruiker mag gebruiken: van de space en globaal."""
+        providers, pagina = [], 1
+        while True:
+            antwoord = self._request("GET", f"/api/ai-provider/?page={pagina}", ok=(200,))
+            providers.extend(p for p in antwoord.get("results") or [] if isinstance(p, dict))
+            if not antwoord.get("next"):
+                return providers
+            pagina += 1
+
+    def ai_step_sort(self, recipe: dict, provider_id: int, *, timeout=(5, 180)) -> dict:
+        """
+        Laat Tandoor de stappen en de indeling van de ingrediënten maken.
+
+        Tandoor slaat hier niets op: het gesorteerde recept komt terug en de
+        aanroeper beslist wat ermee gebeurt. Eén poging - elke aanroep kost
+        tegoed - en een ruime leestimeout, want hier zit een taalmodel achter.
+        """
+        try:
+            antwoord = self._request("POST", f"/api/ai-step-sort/?provider={int(provider_id)}",
+                                     json=recipe, ok=(200,), retry=False, timeout=timeout)
+        except TandoorThrottled:
+            raise
+        except TandoorUnreachable as e:
+            raise TandoorAiError(f"geen antwoord van de AI binnen {timeout[1]} seconden of "
+                                 f"Tandoor niet bereikbaar ({e.message})") from e
+        except TandoorError as e:
+            if e.status == 400 and _is_tegoed_op(e.payload):
+                raise TandoorAiCredits(
+                    "het AI-tegoed van de space is op, of AI staat voor de space uit",
+                    status=400, payload=e.payload) from e
+            raise TandoorAiError(f"AI: {e.message}", status=e.status, payload=e.payload) from e
+        if not isinstance(antwoord, dict):
+            raise TandoorAiError("de AI gaf geen recept terug")
+        return antwoord
 
     def recipe_url(self, recipe_id: int) -> str:
         """De link die ik in de interface wil kunnen aanklikken."""
