@@ -318,6 +318,26 @@ database staan.
 - Daarna wordt nagekeken of het recept staat zoals bedoeld. Zo niet, of mislukt
   een aanvraag, dan zet de brug de oude indeling terug.
 
+### Eén minuut per AI-vraag
+
+De nginx in de Tandoor-container wacht **60 seconden** op een antwoord, en
+dat is niet in te stellen (geen `proxy_read_timeout` in Tandoors eigen
+nginx-configuratie). Duurt de AI langer, dan krijgt de brug een 504, terwijl
+de vraag in Tandoor gewoon doorloopt en tegoed kost.
+
+Daarom krijgt de AI van de brug alleen wat hij nodig heeft om te sorteren:
+per stap de tekst, per ingrediënt de food, eenheid, hoeveelheid en notitie,
+en de ids. Niet het hele recept zoals Tandoor het geeft - met per ingrediënt
+de complete food, omrekeningen en waar het nog meer in staat is dat snel
+50 KB, en Tandoor vraagt het model om dat allemaal terug te typen. Dat duurde
+drie minuten en werd dan afgekapt. Bij een nieuw recept komt de inhoud van de
+ingrediënten daarom uit Tandoors eigen ontleding, en bepaalt de AI de stappen
+en de indeling.
+
+Komt er toch een 504, dan wacht de brug vier minuten met de volgende
+AI-vraag, zodat Tandoor de vorige eerst afmaakt. Zonder die pauze stapelen de
+vragen zich op in Tandoor, en reageert Tandoor ook in je browser niet meer.
+
 ### De limiet geldt voor import én AI samen
 
 In Tandoor tellen de AI en de import mee in **dezelfde** teller (allebei een
@@ -745,3 +765,6 @@ mislukken, dus het staat hier voor de volgende keer:
   zelf ook bijgewerkt.
 - **Er is geen transactie om een aanvraag.** Geen `ATOMIC_REQUESTS`: valt de
   derde stap om, dan zijn de eerste twee al opgeslagen.
+- **De nginx in de container wacht 60 seconden.** `http.d/Recipes.conf.template`
+  zet geen `proxy_read_timeout`, dus de standaard geldt. Een langzame aanroep
+  geeft een 504, terwijl gunicorn erachter gewoon doorwerkt.

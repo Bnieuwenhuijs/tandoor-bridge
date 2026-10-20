@@ -296,13 +296,96 @@ def test_een_mislukte_ai_aanroep_geeft_de_reden(client, tandoor, instelling, red
     if "ai_limiet" in instelling:
         requests.post(f"{tandoor.url}/api/recipe-from-source/", headers=KOP,
                       json={"url": "https://x.nl/r", "data": "<html></html>"})
-    gesorteerd, gekregen = sorteren.sorteer_nieuw(client, 1, {"name": "x", "steps": STAPPEN})
+    gesorteerd, gekregen, _ = sorteren.sorteer_nieuw(client, 1, {"name": "x", "steps": STAPPEN})
     assert gesorteerd is None and reden in gekregen
 
 
-def test_het_antwoord_wordt_overgenomen_zoals_het_is(client, tandoor):
+def test_bij_een_nieuw_recept_bepaalt_de_ai_de_stappen_en_tandoor_de_ingredienten(
+        client, tandoor):
+    # De AI krijgt alleen de slanke vorm, en geeft dus ook alleen die terug.
+    # De stappen en de indeling komen van de AI; wat er in een ingrediënt
+    # staat - de oorspronkelijke regel, de hoeveelheid - uit Tandoors eigen
+    # ontleding. Ook als de AI een hoeveelheid verandert.
+    ai(tandoor, "splitsen")
+    recept = {"name": "Soep", "keywords": [{"id": None, "name": "www.ah.nl"}],
+              "steps": STAPPEN}
+    gesorteerd, reden, notities = sorteren.sorteer_nieuw(client, 1, recept)
+    assert reden is None and notities == []
+    assert [s["instruction"] for s in gesorteerd["steps"]] == [
+        "Snipper de ui.", "Kook de wortel in water.", "Pureer met de room."]
+    assert [[i["original_text"] for i in s["ingredients"]] for s in gesorteerd["steps"]] == [
+        ["1 ui"], ["500 g wortel"], ["100 ml room"]]
+    assert gesorteerd["keywords"] == recept["keywords"]
+    # Geen tijdelijke ids in wat naar Tandoor gaat.
+    assert all("id" not in s for s in gesorteerd["steps"])
+    assert all("id" not in i for s in gesorteerd["steps"] for i in s["ingredients"])
+
     ai(tandoor, "ander-bedrag")
-    gesorteerd, reden = sorteren.sorteer_nieuw(client, 1, {"name": "x", "steps": STAPPEN})
-    assert reden is None
-    # Geen inhoudelijke controle bij een nieuw recept: ook dit gaat zo door.
-    assert gesorteerd["steps"][0]["ingredients"][0]["food"]["name"] == "iets anders"
+    gesorteerd, _, _ = sorteren.sorteer_nieuw(client, 1, recept)
+    assert {i["amount"] for s in gesorteerd["steps"] for i in s["ingredients"]} == {1, 500, 100}
+
+
+# -- de slanke vorm --------------------------------------------------------
+
+def test_de_ai_krijgt_alleen_wat_hij_nodig_heeft(client, tandoor):
+    """
+    Een echt Tandoor-recept van 15 ingrediënten is zo 50 KB: per ingrediënt de
+    hele food, omrekeningen, waar het nog meer in staat. Het model moet het
+    hele recept terugtypen, en deed daar drie minuten over - terwijl de nginx
+    in Tandoor na 60 seconden een 504 geeft.
+    """
+    recept_id = maak(tandoor)
+    volledig = client.get_recipe(recept_id)
+    slank = sorteren.voor_ai(volledig)
+    assert set(slank) == {"name", "steps"}
+    assert set(slank["steps"][0]) == {"id", "instruction", "ingredients"}
+    assert set(slank["steps"][0]["ingredients"][0]) == {"id", "food", "unit", "amount", "note"}
+    assert slank["steps"][0]["ingredients"][0]["food"] == {"name": "ui"}
+    import json
+    assert len(json.dumps(slank)) < len(json.dumps(volledig)) / 2
+
+
+def test_een_groot_recept_haalt_de_60_seconden_met_de_slanke_vorm(client, tandoor):
+    # De mock geeft een 504 als wat er binnenkomt te groot is - zoals de nginx
+    # van Tandoor doet als het model te lang moet typen.
+    ingredienten = [{"food": {"name": f"kruid {n}"}, "unit": {"name": "g"}, "amount": n,
+                     "order": n, "original_text": f"{n} g kruid {n}"} for n in range(30)]
+    recept_id = maak(tandoor, [{"instruction": "Alles. Door elkaar.",
+                                "ingredients": ingredienten}])
+    volledig = client.get_recipe(recept_id)
+    import json
+    grens = len(json.dumps(sorteren.voor_ai(volledig))) + 50
+    assert len(json.dumps(volledig)) > grens, "de test meet niets als volledig ook past"
+    requests.post(f"{tandoor.url}/__mock/ai", json={"ai_max_invoer": grens})
+
+    with pytest.raises(sorteren.TandoorAiTimeout):
+        client.ai_step_sort(volledig, 1)                 # zo ging het mis
+    antwoord = client.ai_step_sort(sorteren.voor_ai(volledig), 1)
+    plan = sorteren.maak_plan(volledig, antwoord)
+    assert sum(len(s["ingredienten"]) for s in plan["stappen"]) == 30
+
+
+def test_een_504_van_de_ai_is_een_time_out_geen_interne_fout(client, tandoor):
+    ai(tandoor, "traag")
+    gesorteerd, reden, _ = sorteren.sorteer_nieuw(client, 1, {"name": "x", "steps": STAPPEN})
+    assert gesorteerd is None
+    assert "60 seconden" in reden and "interne fout" not in reden
+
+
+def test_na_een_time_out_wacht_het_importeren_met_de_ai(client, tandoor):
+    klok = [1000.0]
+    sorteerder = sorteren.Sorteerder(client, klok=lambda: klok[0])
+    ai(tandoor, "traag")
+    _, reden, _ = sorteerder.sorteer_nieuw({"name": "x", "steps": STAPPEN})
+    assert "60 seconden" in reden
+    aanroepen = tandoor.state()["ai_calls"]
+
+    ai(tandoor, "volgens-tekst")
+    klok[0] += 60
+    _, reden, _ = sorteerder.sorteer_nieuw({"name": "x", "steps": STAPPEN})
+    assert "even overgeslagen" in reden
+    assert tandoor.state()["ai_calls"] == aanroepen          # geen nieuwe vraag
+
+    klok[0] += sorteren.NA_TIME_OUT
+    gesorteerd, reden, _ = sorteerder.sorteer_nieuw({"name": "x", "steps": STAPPEN})
+    assert gesorteerd is not None and reden is None

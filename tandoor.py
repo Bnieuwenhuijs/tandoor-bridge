@@ -272,6 +272,19 @@ class TandoorAiError(TandoorError):
     """De AI-aanroep zelf mislukte: een fout, een time-out, het model."""
 
 
+class TandoorAiTimeout(TandoorAiError):
+    """
+    De nginx in de Tandoor-container gaf het op voordat de AI klaar was.
+
+    Die wacht 60 seconden (geen proxy_read_timeout in http.d/Recipes.conf.
+    template, dus de standaard), en is niet via de omgeving in te stellen.
+    De AI-aanroep loopt in Tandoor daarna gewoon door - en kost tegoed - maar
+    het antwoord komt nergens meer aan. Wie dan meteen de volgende vraag
+    stuurt, stapelt aanroepen op in Tandoor, en dan antwoordt Tandoor ook
+    niet meer op wie hem in de browser gebruikt.
+    """
+
+
 class TandoorAiCredits(TandoorAiError):
     """
     Het AI-tegoed van de space is op, of AI staat voor de space uit.
@@ -464,7 +477,12 @@ class TandoorClient:
 
             payload = _payload(resp)
             melding = _message_from(payload, resp.status_code)
-            if 500 <= resp.status_code < 600:
+            if resp.status_code in RETRY_STATUSSEN:
+                # Geen fout van Tandoor zelf: de nginx in de Tandoor-container
+                # (of een proxy ervoor) kreeg geen of geen tijdig antwoord.
+                melding = (f"Tandoor antwoordde niet op tijd (status {resp.status_code} "
+                           f"van de proxy in de Tandoor-container)")
+            elif 500 <= resp.status_code < 600:
                 # Een Django-fout met DEBUG=False stuurt gewone HTML terug
                 # zonder enige uitleg, dus hier is niets zinnigs uit te halen.
                 # De traceback staat in het logboek van Tandoor zelf, en daar
@@ -643,6 +661,11 @@ class TandoorClient:
             raise TandoorAiError(f"geen antwoord van de AI binnen {timeout[1]} seconden of "
                                  f"Tandoor niet bereikbaar ({e.message})") from e
         except TandoorError as e:
+            if e.status in RETRY_STATUSSEN:
+                raise TandoorAiTimeout(
+                    "de AI deed er langer over dan de 60 seconden die de nginx in de "
+                    "Tandoor-container wacht; de vraag loopt in Tandoor nog door en "
+                    "kost wel tegoed", status=e.status, payload=e.payload) from e
             if e.status == 400 and _is_tegoed_op(e.payload):
                 raise TandoorAiCredits(
                     "het AI-tegoed van de space is op, of AI staat voor de space uit",

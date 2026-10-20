@@ -438,7 +438,7 @@ def test_weigert_tandoor_het_ai_resultaat_dan_ongesorteerd(store, client, tandoo
         def sorteer_nieuw(self, recept):
             # Een model dat de naam kwijtraakt: daar geeft Tandoor een 400 op,
             # en daar valt met opschonen niets aan te doen.
-            return {**recept, "name": ""}, None
+            return {**recept, "name": ""}, None, []
 
     rij = ImportQueue(store, client, delay=0, fetch=maak_fetch(),
                       fetch_photo=maak_fotofetch(), sorteerder=Kapot())

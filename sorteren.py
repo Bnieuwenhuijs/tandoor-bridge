@@ -44,8 +44,10 @@ import logging
 import time
 from dataclasses import asdict, dataclass, field
 
-from tandoor import (TandoorAiCredits, TandoorAiError, TandoorClient, TandoorError,
-                     TandoorThrottled)
+import copy
+
+from tandoor import (TandoorAiCredits, TandoorAiError, TandoorAiTimeout, TandoorClient,
+                     TandoorError, TandoorThrottled)
 
 log = logging.getLogger(__name__)
 
@@ -190,6 +192,48 @@ def momentopname(recept: dict) -> dict:
         "stappen": [[s.get("id"), [i.get("id") for i in _ingredienten(s)]]
                     for s in _stappen(recept)],
     }
+
+
+# -- wat de AI te zien krijgt ---------------------------------------------
+
+def voor_ai(recept: dict) -> dict:
+    """
+    Het recept zoals de AI het nodig heeft om te sorteren, en niet meer.
+
+    Tandoor geeft een recept met per ingrediënt de hele food (eigenschappen,
+    categorie, overerving, vervangers), omrekeningen, de recepten waarin het
+    nog meer voorkomt, en per stap ook de markdown. Een recept van 15
+    ingrediënten wordt zo 50 KB. Tandoors prompt zegt "geef het recept terug in
+    hetzelfde formaat", dus het model moet dat allemaal opnieuw uittypen. Dat
+    duurde drie minuten en werd dan halverwege afgekapt (JSONDecodeError in
+    Tandoor), terwijl de nginx in de Tandoor-container na 60 seconden al een
+    504 had gegeven.
+
+    Om te sorteren is alleen nodig: de stappen met hun tekst, en per
+    ingrediënt waar het om gaat. De ids blijven erin, want daarmee leest
+    maak_plan() het antwoord terug. RecipeSerializer(partial=True) keurt dit
+    goed: wat ontbreekt, wordt bij partial overgeslagen.
+    """
+    def naam(waarde):
+        return {"name": waarde.get("name") or ""} if isinstance(waarde, dict) else None
+
+    def ingredient(i: dict) -> dict:
+        uit = {"food": naam(i.get("food")), "unit": naam(i.get("unit")),
+               "amount": i.get("amount") or 0, "note": i.get("note") or ""}
+        if i.get("id") is not None:
+            uit = {"id": i["id"], **uit}
+        if i.get("is_header"):
+            uit["is_header"] = True
+        return uit
+
+    stappen = []
+    for stap in _stappen(recept):
+        uit = {"instruction": stap.get("instruction") or "",
+               "ingredients": [ingredient(i) for i in _ingredienten(stap)]}
+        if stap.get("id") is not None:
+            uit = {"id": stap["id"], **uit}
+        stappen.append(uit)
+    return {"name": recept.get("name") or "", "steps": stappen}
 
 
 # -- van AI-antwoord naar plan --------------------------------------------
@@ -418,26 +462,72 @@ def _probeer_terug(client: TandoorClient, recept_id: int, origineel: dict):
 
 # -- nieuwe recepten -------------------------------------------------------
 
-def sorteer_nieuw(client: TandoorClient, provider_id: int, recept: dict):
-    """
-    (gesorteerd recept, None), of (None, reden) als de AI-aanroep mislukt.
+def _met_tijdelijke_ids(recept: dict) -> dict:
+    """Een kopie met volgnummers als id, zodat het AI-antwoord terug te lezen is."""
+    kopie = copy.deepcopy(recept)
+    teller = 0
+    for nummer, stap in enumerate(_stappen(kopie), start=1):
+        stap["id"] = nummer
+        for ingredient in _ingredienten(stap):
+            teller += 1
+            ingredient["id"] = teller
+    return kopie
 
-    Geen inhoudelijke controle: wat Tandoor teruggeeft, wordt het recept.
+
+def sorteer_nieuw(client: TandoorClient, provider_id: int, recept: dict, *,
+                  bij_time_out=None):
     """
+    (gesorteerd recept, None, notities), of (None, reden, []) als de
+    AI-aanroep mislukt.
+
+    De AI krijgt de slanke vorm (voor_ai) en bepaalt de stappen: hoeveel,
+    met welke tekst, en welk ingrediënt waar. De ingrediënten zelf komen uit
+    wat Tandoor bij het ontleden maakte - met de oorspronkelijke regel, de
+    notitie en de rest - want die stuurt de AI in de slanke vorm niet terug.
+    Elk ingrediënt komt precies één keer in het recept, net als bij een
+    bestaand recept; wat er daarvoor bijgesteld moest worden, staat in de
+    notities.
+
+    bij_time_out wordt aangeroepen als Tandoors nginx het opgaf (504): dan
+    loopt de vraag in Tandoor nog, en hoort de volgende even te wachten.
+    """
+    met_ids = _met_tijdelijke_ids(recept)
     try:
-        antwoord = client.ai_step_sort(recept, provider_id)
+        antwoord = client.ai_step_sort(voor_ai(met_ids), provider_id)
     except TandoorThrottled as e:
-        return None, f"AI-limiet bereikt (weer mogelijk over {e.retry_after} s)"
-    except TandoorAiCredits as e:
-        return None, e.message
-    except TandoorAiError as e:
-        return None, e.message
+        return None, f"AI-limiet bereikt (weer mogelijk over {e.retry_after} s)", []
+    except TandoorAiTimeout as e:
+        if bij_time_out:
+            bij_time_out()
+        return None, e.message, []
+    except (TandoorAiCredits, TandoorAiError) as e:
+        return None, e.message, []
     except TandoorError as e:
-        return None, f"AI: {e.message}"
-    gesorteerd = _uitpakken(antwoord)
-    if not isinstance(gesorteerd, dict) or not _stappen(gesorteerd):
-        return None, "de AI gaf geen stappen terug"
-    return gesorteerd, None
+        return None, f"AI: {e.message}", []
+    try:
+        plan = maak_plan(met_ids, antwoord)
+    except PlanFout as e:
+        return None, str(e), []
+
+    orig_stappen = {s["id"]: s for s in _stappen(met_ids)}
+    orig_ingr = {i["id"]: i for s in _stappen(met_ids) for i in _ingredienten(s)}
+    eerste = _stappen(met_ids)[0]
+    stappen = []
+    for nummer, stap in enumerate(plan["stappen"]):
+        basis = dict(orig_stappen.get(stap["id"]) or {
+            "name": "", "time": 0,
+            "show_ingredients_table": eerste.get("show_ingredients_table", True)})
+        basis.pop("id", None)
+        basis["instruction"] = stap["instruction"]
+        basis["order"] = nummer
+        basis["ingredients"] = []
+        for volgorde, iid in enumerate(stap["ingredienten"]):
+            ingredient = dict(orig_ingr[iid])
+            ingredient.pop("id", None)
+            ingredient["order"] = volgorde
+            basis["ingredients"].append(ingredient)
+        stappen.append(basis)
+    return {**recept, "steps": stappen}, None, plan["notities"]
 
 
 # -- bij het importeren ----------------------------------------------------
@@ -461,6 +551,10 @@ class Sorteerder:
         self._klok = klok or time.monotonic
         self._provider: Provider | None = None
         self._sinds = 0.0
+        # Na een 504 loopt de vorige AI-vraag in Tandoor nog door. Tot dit
+        # moment slaan we sorteren bij het importeren over, anders stapelen
+        # de vragen zich daar op.
+        self._rust_tot = 0.0
 
     def provider(self, *, vers: bool = False) -> Provider:
         if vers or self._provider is None or self._klok() - self._sinds > self._geldig:
@@ -474,10 +568,25 @@ class Sorteerder:
         return self._provider
 
     def sorteer_nieuw(self, recept: dict):
-        """(gesorteerd, None), (None, reden), of (None, None) als het uitstaat."""
+        """
+        (gesorteerd, None, notities), (None, reden, []), of (None, None, [])
+        als het uitstaat.
+        """
         if not self.aan:
-            return None, None
+            return None, None, []
+        if self._klok() < self._rust_tot:
+            return None, ("AI even overgeslagen: de vorige vraag liep in Tandoor nog "
+                          "na een time-out"), []
         provider = self.provider()
         if provider.id is None:
-            return None, provider.uitleg
-        return sorteer_nieuw(self.client, provider.id, recept)
+            return None, provider.uitleg, []
+        return sorteer_nieuw(self.client, provider.id, recept,
+                             bij_time_out=self.rust_na_time_out)
+
+    def rust_na_time_out(self):
+        self._rust_tot = self._klok() + NA_TIME_OUT
+
+
+# Hoe lang na een 504 er geen nieuwe AI-vraag naar Tandoor gaat. In de logs
+# van een echte Tandoor liep zo'n vraag na de 504 nog ruim twee minuten door.
+NA_TIME_OUT = 240.0

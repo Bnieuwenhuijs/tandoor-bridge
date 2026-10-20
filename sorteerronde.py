@@ -30,8 +30,8 @@ from datetime import datetime, timezone
 
 import sorteren
 from sorteren import GESORTEERD, MISLUKT, OVERGESLAGEN, WACHTEND
-from tandoor import (TandoorAiCredits, TandoorAiError, TandoorError, TandoorThrottled,
-                     TandoorUnreachable)
+from tandoor import (TandoorAiCredits, TandoorAiError, TandoorAiTimeout, TandoorError,
+                     TandoorThrottled, TandoorUnreachable)
 
 log = logging.getLogger(__name__)
 
@@ -373,7 +373,15 @@ class SorteerRonde:
 
         self.bezig = {"recipe_id": rid, "naam": naam, "wat": "AI vraagt"}
         try:
-            antwoord = self.client.ai_step_sort(recept, provider.id)
+            antwoord = self.client.ai_step_sort(sorteren.voor_ai(recept), provider.id)
+        except TandoorAiTimeout as e:
+            # De vraag loopt in Tandoor nog door. Meteen de volgende sturen
+            # stapelt ze op, en dan reageert Tandoor ook in de browser niet.
+            self.store.zet(rid, MISLUKT, reden=e.message, naam=naam)
+            wacht = max(self.ai_pauze, sorteren.NA_TIME_OUT)
+            self.store.zet_ronde(melding=f"time-out bij de AI; volgende vraag over {wacht:g} s, "
+                                         f"zodat Tandoor de vorige eerst afmaakt")
+            return wacht
         except TandoorThrottled as e:
             self.store.zet_ronde(melding=f"AI-limiet bereikt; verder over {e.retry_after} s")
             return float(e.retry_after)

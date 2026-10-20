@@ -320,3 +320,27 @@ def test_te_bekijken_is_een_eigen_filter(ronde, tandoor):
     ronde.stap()
     assert [i["naam"] for i in ronde.store.items(status="te_bekijken")] == ["Soep 1"]
     assert [i["naam"] for i in ronde.store.items(status="voorstel")] == ["Soep 0"]
+
+
+def test_de_ronde_stuurt_de_slanke_vorm(ronde, tandoor):
+    maak(tandoor, SORTEERBAAR)
+    ronde.begin(PROEFDRAAI)
+    draai(ronde)
+    body = tandoor.state()["laatste_ai_body"]
+    assert set(body) == {"name", "steps"}
+    assert set(body["steps"][0]["ingredients"][0]) <= {"id", "food", "unit", "amount", "note",
+                                                       "is_header"}
+
+
+def test_na_een_time_out_wacht_de_ronde_tot_tandoor_klaar_is(ronde, tandoor):
+    import sorteren
+
+    rid = maak(tandoor, SORTEERBAAR)
+    requests.post(f"{tandoor.url}/__mock/ai", json={"ai_gedrag": "traag"})
+    ronde.begin(PROEFDRAAI)
+    ronde.stap()                                    # ophalen
+    wacht = ronde.stap()
+    assert wacht >= sorteren.NA_TIME_OUT
+    item = ronde.store.item(rid)
+    assert item["status"] == MISLUKT and "60 seconden" in item["reden"]
+    assert "time-out" in ronde.store.ronde()["melding"]

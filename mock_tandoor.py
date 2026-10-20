@@ -61,7 +61,8 @@ class State:
 
     def __init__(self, *, token_prefix="tda_", throttle_after=0, retry_after=5,
                  ai_providers=None, ai_default_provider=None, ai_enabled=True,
-                 ai_tegoed=None, ai_gedrag="volgens-tekst", ai_limiet=0):
+                 ai_tegoed=None, ai_gedrag="volgens-tekst", ai_limiet=0,
+                 ai_max_invoer=0):
         self.opslag = Opslag()
         self.token_prefix = token_prefix
         # De AI-kant. ai_tegoed=None is onbeperkt; ai_limiet=0 is geen limiet.
@@ -72,6 +73,10 @@ class State:
         self.ai_tegoed = ai_tegoed
         self.ai_gedrag = ai_gedrag
         self.ai_limiet = ai_limiet
+        # Groter dan dit (in tekens JSON), en het model is niet binnen de
+        # 60 seconden van Tandoors nginx klaar: 504. 0 is geen grens.
+        self.ai_max_invoer = ai_max_invoer
+        self.laatste_ai_body = None
         self.ai_calls = 0
         # AiEndpointThrottle en RecipeImportThrottle zijn allebei een
         # UserRateThrottle zonder eigen scope, dus allebei de cachesleutel
@@ -592,6 +597,18 @@ def create_app(*, throttle_after=0, retry_after=5, token_prefix="tda_", **ai):
         body = request.get_json(silent=True)
         if not isinstance(body, dict):
             return jsonify({"non_field_errors": ["Invalid data."]}), 400
+        state.laatste_ai_body = body
+        te_groot = state.ai_max_invoer and len(json.dumps(body)) > state.ai_max_invoer
+        if state.ai_gedrag == "traag" or te_groot:
+            # Wat een echte Tandoor met een groot recept doet: de nginx in de
+            # container wacht 60 seconden en geeft dan zijn eigen 504-pagina.
+            # Het model rekent intussen door, en dat kost tegoed.
+            state.ai_calls += 1
+            if state.ai_tegoed is not None:
+                state.ai_tegoed -= 1
+            return ("<html><head><title>504 Gateway Time-out</title></head><body>"
+                    "<center><h1>504 Gateway Time-out</h1></center><hr><center>nginx"
+                    "</center></body></html>", 504, {"Content-Type": "text/html"})
         # RecipeSerializer(partial=True): dezelfde nulls die create weigert.
         if "servings" in body and body["servings"] is None:
             return jsonify({"servings": ["This field may not be null."]}), 400
@@ -641,7 +658,7 @@ def create_app(*, throttle_after=0, retry_after=5, token_prefix="tda_", **ai):
         """Verander het AI-gedrag midden in een test."""
         body = request.get_json(silent=True) or {}
         for sleutel in ("ai_gedrag", "ai_tegoed", "ai_enabled", "ai_limiet",
-                        "ai_default_provider", "ai_providers"):
+                        "ai_default_provider", "ai_providers", "ai_max_invoer"):
             if sleutel in body:
                 setattr(state, sleutel, body[sleutel])
         if body.get("teller_terug"):
@@ -656,6 +673,7 @@ def create_app(*, throttle_after=0, retry_after=5, token_prefix="tda_", **ai):
             "recipes": [state.opslag.recept(i) for i in sorted(state.opslag.recepten)],
             "tellingen": state.opslag.tellingen(),
             "ai_calls": state.ai_calls,
+            "laatste_ai_body": state.laatste_ai_body,
             "ai_tegoed": state.ai_tegoed,
             "import_calls": state.import_calls,
             "images": {str(k): v[0] for k, v in state.images.items()},

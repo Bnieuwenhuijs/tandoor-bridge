@@ -458,10 +458,11 @@ class ImportQueue:
         notities = []
         te_maken = bron.recipe
         if self.sorteerder is not None:
-            gesorteerd, reden = self.sorteerder.sorteer_nieuw(recipe_payload(
+            gesorteerd, reden, bijgesteld = self.sorteerder.sorteer_nieuw(recipe_payload(
                 bron.recipe, url, send_properties=getattr(self.client, "send_properties", False)))
             if gesorteerd is not None:
                 te_maken = gesorteerd
+                notities.extend(f"sortering: {n}" for n in bijgesteld)
             elif reden:
                 notities.append(f"ongesorteerd: {reden}")
 
