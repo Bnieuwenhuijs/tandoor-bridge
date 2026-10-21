@@ -226,8 +226,15 @@ _SELECTIES = (
               frozenset({"url", "width", "height", "rendition"})),
     _Selectie("courses", ("courses",)),
     _Selectie("cuisines", ("cuisines",)),
+    _Selectie("tags", ("tags { key value }",), frozenset({"key", "value"})),
     _Selectie("tips", ("tips { type value }",), frozenset({"type", "value"})),
 )
+
+# Van de AH-tags alleen de groepen die iets zeggen over het gerecht zelf
+# (vegetarisch, gezond, salade, soep). "momenten" ("wat eten we vandaag") en
+# "kooktechniek" zouden alleen nieuwe, nietszeggende trefwoorden in Tandoor
+# opleveren.
+TAG_GROEPEN = frozenset({"speciale-wensen", "soort-gerecht"})
 
 _QUERY = """query Recept($id: Int!) {
   recipe(id: $id) {
@@ -628,6 +635,8 @@ def to_jsonld(recept: dict, url: str) -> dict:
                                   for stap in _stappen(recept) + _tips(recept)]
     trefwoorden = [_tekst(woord) for sleutel in ("courses", "cuisines")
                    for woord in _lijst(recept.get(sleutel))]
+    trefwoorden += [_tekst(tag.get("value")) for tag in _lijst(recept.get("tags"))
+                    if isinstance(tag, dict) and tag.get("key") in TAG_GROEPEN]
     if trefwoorden := [woord for woord in trefwoorden if woord]:
         data["keywords"] = ", ".join(dict.fromkeys(trefwoorden))
     return data

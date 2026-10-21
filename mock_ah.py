@@ -34,8 +34,9 @@ SCHEMA = {
         "courses": None, "cuisines": None,
         "servings": "Servings", "rating": "Rating", "images": "Image",
         "ingredients": "RecipeIngredient", "preparation": "Preparation",
-        "tips": "Tip",
+        "tips": "Tip", "tags": "Tag",
     },
+    "Tag": {"key": None, "value": None},
     "Servings": {"number": None, "type": None},
     "Rating": {"average": None, "count": None},
     "Image": {"url": None, "width": None, "height": None, "rendition": None},
@@ -86,6 +87,13 @@ RECEPT = {
     },
     "tips": [
         {"type": "algemeen", "value": "Lekker met een lik zure room."},
+    ],
+    "tags": [
+        {"key": "speciale-wensen", "value": "glutenvrij"},
+        {"key": "soort-gerecht", "value": "traybake"},
+        {"key": "menugang", "value": "hoofdgerecht"},
+        {"key": "momenten", "value": "wat eten we vandaag"},
+        {"key": "kooktechniek", "value": "ovenbereiding"},
     ],
 }
 

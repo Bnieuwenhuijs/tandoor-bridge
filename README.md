@@ -481,6 +481,11 @@ beschrijving: die knipt Tandoor af op 512 tekens, en boven de 256 zet hij hem
 ook nog eens voor stap 1, zodat je hem twee keer leest. Het domein-trefwoord `www.ah.nl` komt er via de
 canonical in, dus Food Replace-regels met een bron-regex vuren ook.
 
+Trefwoorden: de menugang en de keuken, plus van de AH-tags alleen de groepen
+"speciale wensen" en "soort gerecht" (vegetarisch, gezond, salade, soep). De
+andere tags, zoals "wat eten we vandaag", zouden alleen nietszeggende nieuwe
+trefwoorden in Tandoor opleveren.
+
 De oven- en wachttijd staan niet bij het recept zelf in de app-API, alleen in
 de zoekresultaten (`recipeSearch` → `time { cook oven wait }`). De brug zoekt
 daarom één keer op de titel en neemt de tijd van het resultaat met hetzelfde

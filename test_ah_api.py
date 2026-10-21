@@ -386,7 +386,9 @@ def test_de_pagina_ziet_eruit_als_de_echte(ah):
         "@type": "HowToStep", "text": "Verwarm de oven voor op 200 °C."}
     # De grootste afbeelding eerst: die wil Tandoor als foto.
     assert data["image"][0].endswith("width=1200")
-    assert data["keywords"] == "hoofdgerecht, mexicaans"
+    # Van de tags alleen speciale-wensen en soort-gerecht; hoofdgerecht stond
+    # er via courses al in en komt er niet dubbel bij.
+    assert data["keywords"] == "hoofdgerecht, mexicaans, glutenvrij, traybake"
     # De tip is de laatste stap, na de echte drie. Niet in de beschrijving:
     # die knipt Tandoor af op 512 tekens en zet hij boven de 256 nog eens voor
     # stap 1 (get_from_scraper).
