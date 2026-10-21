@@ -89,6 +89,10 @@ RECEPT = {
     ],
 }
 
+# De tijd zoals AH hem alleen bij een zoekresultaat geeft: op recipe(id:)
+# bestaat "time" niet (gemeten), op het zoektype wel.
+ZOEK_TIJD = {"cook": 20, "oven": 15, "wait": None}
+
 # Velden, accolades en namen; argumenten tussen ronde haken slaan we over.
 _TOKEN_RE = re.compile(r"\(.*?\)|[{}]|[A-Za-z_][A-Za-z0-9_]*", re.S)
 
@@ -156,7 +160,8 @@ def _snij(waarde, boom: dict):
 def create_app(*, schema=None, recept=None, token_leeft=7199,
                oude_foutvorm=False, geen_token=False, fout_status=400,
                suggesties=False, weigering_als_graphql=False,
-               half_antwoord=False, leeg_antwoord=False) -> Flask:
+               half_antwoord=False, leeg_antwoord=False, zoek_tijd=ZOEK_TIJD,
+               zoeken_mislukt=False) -> Flask:
     """
     schema          : welke velden bestaan (standaard: alles uit SCHEMA)
     oude_foutvorm   : 'Cannot query field "x" on type "Y"' in plaats van de
@@ -173,6 +178,9 @@ def create_app(*, schema=None, recept=None, token_leeft=7199,
     half_antwoord   : het recept komt, maar met een melding in "errors" die
                       niet over een veld gaat (een resolver die faalde)
     leeg_antwoord   : /graphql antwoordt {} - geen data, geen errors
+    zoek_tijd       : de time { cook oven wait } bij het zoekresultaat; None
+                      is: het recept komt niet in de zoekresultaten voor
+    zoeken_mislukt  : recipeSearch geeft een 500
     """
     schema = schema or SCHEMA
     recept = recept if recept is not None else RECEPT
@@ -203,6 +211,21 @@ def create_app(*, schema=None, recept=None, token_leeft=7199,
         app.config["gezien"].append(("graphql", query))
         if leeg_antwoord:
             return jsonify({})
+        if "recipeSearch" in query:
+            if zoeken_mislukt:
+                return jsonify({"message": "Internal Server Error"}), 500
+            zoekterm = str(((body.get("variables") or {}).get("query") or {})
+                           .get("searchText") or "")
+            gevonden = []
+            if zoek_tijd is not None and zoekterm and zoekterm.lower() in \
+                    str(recept.get("title") or "").lower():
+                gevonden.append({"id": recept["id"], "title": recept.get("title"),
+                                 "time": dict(zoek_tijd)})
+            # Een ander recept met een gelijkende titel ervoor, zoals bij AH.
+            resultaten = [{"id": 999, "title": "Iets anders", "time": {"cook": 5, "oven": 99,
+                                                                       "wait": None}}]
+            return jsonify({"data": {"recipeSearch": {"page": {"total": 1 + len(gevonden)},
+                                                      "result": resultaten + gevonden}}})
         gevraagd = _gevraagde_velden(query)
         if not gevraagd:
             return jsonify({"errors": [{"message": "no recipe selection"}]})

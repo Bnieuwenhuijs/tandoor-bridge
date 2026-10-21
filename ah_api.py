@@ -212,11 +212,9 @@ _SELECTIES = (
               ("preparation { steps summary }", "preparation { steps }"),
               frozenset({"steps", "summary"})),
     _Selectie("description", ("description",)),
-    # cookTime is de bereidingstijd. AH splitst die elders wél in bereiden,
-    # oven en wachten (time { cook oven wait }), maar alleen op het type dat
-    # uit een zoekopdracht komt: op recipe(id:) bestaat dat veld niet, en dan
-    # kost het vragen alleen een ronde. _tijden() leest het wel, voor als AH
-    # het hier ooit toevoegt.
+    # cookTime is de bereidingstijd. De oventijd en de wachttijd staan niet op
+    # recipe(id:), alleen op het type dat uit een zoekopdracht komt
+    # (time { cook oven wait }); die halen we er met _tijd_uit_zoeken() bij.
     _Selectie("cookTime", ("cookTime",)),
     _Selectie("servings", ("servings { number type }", "servings { number }"),
               frozenset({"number", "type"})),
@@ -340,6 +338,42 @@ def reset_schema() -> None:
         _stand, _stand_sinds = None, 0.0
 
 
+_ZOEK_TIJD = """query RecipeSearch($query: RecipeSearchParams!) {
+  recipeSearch(query: $query) {
+    result { id time { cook oven wait } }
+  }
+}"""
+
+
+def _tijd_uit_zoeken(recipe_id: int, titel, *, api_url: str, session, bearer: str):
+    """
+    De oven- en wachttijd van een recept, of None.
+
+    AH geeft die alleen bij een zoekresultaat, dus zoeken we op de titel en
+    nemen we het resultaat met hetzelfde nummer. Dezelfde vraag als in de
+    openbare client albert-heijn-mcp. Lukt het niet - geen resultaat, een
+    andere titel, een fout - dan is er geen wachttijd, en verder niets: het
+    recept zelf hebben we al.
+    """
+    if not titel:
+        return None
+    try:
+        antwoord = _graphql(_ZOEK_TIJD, {"query": {"searchText": str(titel), "size": 25}},
+                            api_url=api_url, session=session, bearer=bearer)
+    except AhError as e:
+        log.info("geen oventijd voor recept %s: zoeken mislukte (%s)", recipe_id, e.reason)
+        return None
+    zoek = (antwoord.get("data") or {}).get("recipeSearch") if isinstance(
+        antwoord.get("data"), dict) else None
+    for resultaat in (zoek or {}).get("result") or []:
+        if isinstance(resultaat, dict) and resultaat.get("id") == recipe_id \
+                and isinstance(resultaat.get("time"), dict):
+            return resultaat["time"]
+    log.info("geen oventijd voor recept %s: niet gevonden bij het zoeken op de titel",
+             recipe_id)
+    return None
+
+
 def fetch_recipe(recipe_id: int, *, api_url: str | None = None, session=None) -> dict:
     """Het recept zoals AH het geeft. Gooit AhError met een leesbare reden."""
     try:
@@ -382,6 +416,11 @@ def _fetch_recipe(recipe_id: int, *, api_url: str | None = None, session=None) -
                                 "; ".join(_berichten(fouten)[:3])[:300])
                 with _stand_slot:
                     _stand, _stand_sinds = dict(stand), time.time()
+                if not isinstance(recept.get("time"), dict):
+                    tijd = _tijd_uit_zoeken(recipe_id, recept.get("title"),
+                                            api_url=api_url, session=eigen, bearer=bearer)
+                    if tijd:
+                        recept = {**recept, "time": tijd}
                 return recept
             if not fouten:
                 if isinstance(data, dict) and "recipe" in data:

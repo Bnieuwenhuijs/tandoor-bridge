@@ -216,6 +216,37 @@ def test_een_ah_recept_gaat_via_de_api_naar_tandoor(store, client, tandoor, monk
     assert eerste["food"]["name"] == "kipfilet"
     # En het domein-trefwoord klopt, want de canonical wees naar ah.nl.
     assert {"id": None, "name": "www.ah.nl"} in recept["keywords"]
+    # De oventijd uit de zoekresultaten van de app wordt Tandoors wachttijd.
+    assert recept["working_time"] == 20
+    assert recept["waiting_time"] == 15
+
+
+def _pagina_met_tijden(**tijden):
+    import json
+    schema = {"@context": "https://schema.org", "@type": "Recipe",
+              "name": "Stoofpot", "recipeIngredient": ["1 ui"],
+              "recipeInstructions": ["Stoven."], **tijden}
+    return ("<html><head><script type=\"application/ld+json\">"
+            + json.dumps(schema) + "</script></head><body></body></html>")
+
+
+@pytest.mark.parametrize("tijden, werk, wacht", [
+    # Geen cookTime, wel bereiding en totaal: het verschil is de wachttijd.
+    ({"prepTime": "PT15M", "totalTime": "PT1H"}, 15, 45),
+    # Tandoor vulde de wachttijd zelf al: daar blijven we af.
+    ({"prepTime": "PT15M", "cookTime": "PT30M", "totalTime": "PT1H"}, 15, 30),
+    # Alleen een totale tijd: niet te zeggen welk deel wachten is.
+    ({"totalTime": "PT1H"}, 60, 0),
+    # Totaal gelijk aan de bereiding: niets te wachten.
+    ({"prepTime": "PT20M", "totalTime": "PT20M"}, 20, 0),
+])
+def test_wachttijd_uit_totaal_min_bereiding(store, client, tandoor, tijden, werk, wacht):
+    rij = ImportQueue(store, client, delay=0, fetch=maak_fetch(_pagina_met_tijden(**tijden)),
+                      fetch_photo=maak_fotofetch())
+    store.add([TWEEDE_URL])
+    assert rij.process_once()["status"] == KLAAR
+    recept = tandoor.state()["recipes"][0]
+    assert (recept["working_time"], recept["waiting_time"]) == (werk, wacht)
 
 
 def test_een_fout_stopt_de_rest_niet(store, client):

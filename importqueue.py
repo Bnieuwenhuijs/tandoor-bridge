@@ -30,6 +30,7 @@ from tandoor import (
     TandoorUnreachable,
     recipe_payload,
 )
+import wachttijd
 from urls import dedupe_key, extract_urls, normalize_url
 
 log = logging.getLogger(__name__)
@@ -452,21 +453,30 @@ class ImportQueue:
                               note="stond al in Tandoor")
             return {"status": BESTAAT_AL, "wait": 0}
 
-        # 5. Sorteren: Tandoors AI verdeelt de ingrediënten over de stappen.
+        # 5. Een wachttijd die op de pagina staat maar die Tandoor liet liggen:
+        #    alleen een bereidingstijd en een totale tijd, geen cookTime. Zie
+        #    wachttijd.py; in elk ander geval blijft staan wat Tandoor maakte.
+        basis = bron.recipe
+        if extra := wachttijd.ontbrekende_wachttijd(bron.recipe, pagina.html):
+            log.info("[%s] wachttijd %s min uit totale tijd min bereidingstijd",
+                     item_id, extra)
+            basis = {**bron.recipe, "waiting_time": extra}
+
+        # 6. Sorteren: Tandoors AI verdeelt de ingrediënten over de stappen.
         #    Mislukt dat - een fout, een time-out, de limiet, het tegoed - dan
         #    wordt het recept gewoon ongesorteerd aangemaakt, met de reden erbij.
         notities = []
-        te_maken = bron.recipe
+        te_maken = basis
         if self.sorteerder is not None:
             gesorteerd, reden, bijgesteld = self.sorteerder.sorteer_nieuw(recipe_payload(
-                bron.recipe, url, send_properties=getattr(self.client, "send_properties", False)))
+                basis, url, send_properties=getattr(self.client, "send_properties", False)))
             if gesorteerd is not None:
                 te_maken = gesorteerd
                 notities.extend(f"sortering: {n}" for n in bijgesteld)
             elif reden:
                 notities.append(f"ongesorteerd: {reden}")
 
-        # 6. Aanmaken.
+        # 7. Aanmaken.
         try:
             try:
                 recept = self.client.create_recipe(te_maken, source_url=url)
@@ -476,11 +486,11 @@ class ImportQueue:
                 # Tandoor het zelf ontleedde. Een 429 of een onbereikbare
                 # Tandoor gaan wel naar de afhandeling hieronder: bij die laatste
                 # kan het recept er al staan.
-                if te_maken is bron.recipe or e.status != 400:
+                if te_maken is basis or e.status != 400:
                     raise
                 log.warning("[%s] Tandoor weigerde het AI-resultaat: %s", item_id, e.message)
                 notities.append(f"ongesorteerd: Tandoor weigerde het AI-resultaat ({e.message})")
-                recept = self.client.create_recipe(bron.recipe, source_url=url)
+                recept = self.client.create_recipe(basis, source_url=url)
         except TandoorThrottled as e:
             return self._handle_throttle(item, e)
         except TandoorUnreachable as e:
@@ -496,7 +506,7 @@ class ImportQueue:
         recipe_id = recept.get("id")
         titel = recept.get("name") or bron.recipe.get("name")
 
-        # 7. Foto. Een recept zonder foto is nog steeds een goed recept, dus
+        # 8. Foto. Een recept zonder foto is nog steeds een goed recept, dus
         #    een mislukte foto is een aantekening en geen mislukking.
         if foto := self._attach_photo(recipe_id, bron, pagina):
             notities.append(foto)

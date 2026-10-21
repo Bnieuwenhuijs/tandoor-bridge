@@ -260,7 +260,11 @@ def _build_recipe(schema, html, source_url):
         "description": (schema.get("description") or "")[:256],
         "servings": int(aantal.group()) if aantal else None,
         "servings_text": "" if porties else "None",
-        "working_time": _minuten(schema.get("prepTime")),
+        # get_from_scraper: prepTime wordt de werktijd, cookTime de wachttijd,
+        # en alleen als die allebei nul zijn wordt totalTime de werktijd.
+        "working_time": (_minuten(schema.get("prepTime"))
+                         or (0 if _minuten(schema.get("cookTime"))
+                             else _minuten(schema.get("totalTime")))),
         "waiting_time": _minuten(schema.get("cookTime")),
         "image_url": afbeelding,
         "keywords": trefwoorden,

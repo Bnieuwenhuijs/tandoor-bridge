@@ -107,7 +107,7 @@ def test_recept_ophalen(ah):
     assert recept["title"].startswith("Traybake")
     assert recept["ingredients"][0]["text"] == "600 g kipfilet"
     # In een rondje: alle velden bestaan, dus er is niets bij te stellen.
-    assert len([r for r in gezien(ah) if r[0] == "graphql"]) == 1
+    assert len([r for r in gezien(ah) if r[0] == "graphql" and "recipeSearch" not in r[1]]) == 1
 
 
 @pytest.mark.parametrize("weigering_als_graphql", [False, True],
@@ -145,10 +145,10 @@ def test_velden_die_ah_niet_kent_gaan_eruit():
     server = ah_server(schema=schema)
     try:
         html, recept = ah_api.fetch_page_html(URL, api_url=server.url)
-        rondes = len([r for r in gezien(server) if r[0] == "graphql"])
+        rondes = len([r for r in gezien(server) if r[0] == "graphql" and "recipeSearch" not in r[1]])
         # Tweede recept: nu weet de brug al welke vraag werkt.
         ah_api.fetch_recipe(1194169, api_url=server.url)
-        daarna = len([r for r in gezien(server) if r[0] == "graphql"]) - rondes
+        daarna = len([r for r in gezien(server) if r[0] == "graphql" and "recipeSearch" not in r[1]]) - rondes
     finally:
         server.stop()
 
@@ -332,15 +332,15 @@ def test_een_uitgezochte_vraag_wordt_na_een_dag_opnieuw_geprobeerd(monkeypatch):
     try:
         ah_api.fetch_recipe(1194169, api_url=server.url)
         assert ah_api._stand["images"] == len(ah_api._SELECTIES[5].vormen)
-        rondes = len([r for r in gezien(server) if r[0] == "graphql"])
+        rondes = len([r for r in gezien(server) if r[0] == "graphql" and "recipeSearch" not in r[1]])
         # Binnen de dag: meteen de uitgezochte vraag, in één ronde.
         ah_api.fetch_recipe(1194169, api_url=server.url)
-        assert len([r for r in gezien(server) if r[0] == "graphql"]) == rondes + 1
+        assert len([r for r in gezien(server) if r[0] == "graphql" and "recipeSearch" not in r[1]]) == rondes + 1
         # Een dag later: weer van de rijkste vraag af, dus images wordt opnieuw
         # gevraagd.
         monkeypatch.setattr(ah_api, "_stand_sinds", time.time() - ah_api.SCHEMA_GELDIG - 1)
         ah_api.fetch_recipe(1194169, api_url=server.url)
-        vragen = [r[1] for r in gezien(server) if r[0] == "graphql"]
+        vragen = [r[1] for r in gezien(server) if r[0] == "graphql" and "recipeSearch" not in r[1]]
     finally:
         server.stop()
     assert "images" in vragen[rondes + 1]
@@ -377,11 +377,11 @@ def test_de_pagina_ziet_eruit_als_de_echte(ah):
         "1½ el chipotlepasta", "400 g zwarte bonen",
     ]
     assert data["recipeYield"] == "4 personen"
-    # De tijd gaat naar prepTime, want Tandoor maakt daar working_time van.
-    # cookTime zou in de wachttijd belanden, en dan staat de bereidingstijd in
-    # Tandoor op nul.
+    # Bereiden naar prepTime (Tandoors werktijd), de oventijd - die AH alleen
+    # bij een zoekresultaat geeft - naar cookTime (Tandoors wachttijd).
     assert data["prepTime"] == "PT20M"
-    assert "cookTime" not in data
+    assert data["cookTime"] == "PT15M"
+    assert data["totalTime"] == "PT35M"
     assert data["recipeInstructions"][0] == {
         "@type": "HowToStep", "text": "Verwarm de oven voor op 200 °C."}
     # De grootste afbeelding eerst: die wil Tandoor als foto.
@@ -512,3 +512,30 @@ def test_een_vreemde_maat_breekt_de_omzetting_niet():
                                               "name": {"singular": "ui"}}]}, URL)
     assert data["recipeIngredient"] == ["ui"]
     assert "recipeYield" not in data and "prepTime" not in data
+
+
+
+# -- oven- en wachttijd ----------------------------------------------------
+
+def test_de_oventijd_komt_uit_het_zoekresultaat_met_hetzelfde_nummer(ah):
+    recept = ah_api.fetch_recipe(1194169, api_url=ah.url)
+    # Niet die van "Iets anders" (oven 99), dat de zoekopdracht ook vindt.
+    assert recept["time"] == {"cook": 20, "oven": 15, "wait": None}
+    assert ah_api._tijden(recept) == (20, 15)
+
+
+@pytest.mark.parametrize("opties", [{"zoek_tijd": None}, {"zoeken_mislukt": True}])
+def test_zonder_zoekresultaat_is_er_geen_wachttijd_maar_wel_een_recept(opties):
+    server = ah_server(**opties)
+    try:
+        html, recept = ah_api.fetch_page_html(URL, api_url=server.url)
+    finally:
+        server.stop()
+    data = jsonld(html)
+    assert data["prepTime"] == "PT20M" and "cookTime" not in data
+    assert data["recipeIngredient"][0] == "600 g kipfilet"
+
+
+def test_de_wachttijd_telt_op_bij_de_oventijd():
+    # "wait" is marineren, laten rijzen, laten opstijven: ook wachttijd.
+    assert ah_api._tijden({"time": {"cook": 15, "oven": 30, "wait": 60}}) == (15, 90)

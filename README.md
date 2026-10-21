@@ -52,6 +52,18 @@ Elke URL krijgt een eigen regel in SQLite met een eigen status
 lijst-import van Tandoor zelf verkeerd doet. Wat onderweg was toen de
 container stopte, gaat bij de start terug in de rij.
 
+### Werktijd en wachttijd
+
+Tandoor zet `prepTime` van de pagina in de werktijd en `cookTime` in de
+wachttijd. Veel sites geven geen `cookTime`, maar wel een bereidingstijd en
+een totale tijd ("15 min bezig, 1 uur totaal"). Dan blijft de wachttijd 0.
+De brug vult hem in dat geval aan met totaal min bereiding, maar alleen als
+het eenduidig is: er staat geen `cookTime`, Tandoor nam de bereidingstijd als
+werktijd, en de totale tijd is langer. Alleen uit de velden van de pagina,
+niet uit de tekst van de stappen ("25 min in de oven" lezen is raden). Dit
+geldt voor nieuwe imports; recepten die al in Tandoor staan blijven zoals ze
+zijn.
+
 ## Installeren op een Ugreen NAS (UGOS)
 
 Je hebt nodig: Docker (zit in UGOS), een map op de NAS, en een Tandoor-token.
@@ -462,12 +474,19 @@ Die regels gaan onbewerkt naar Tandoor, die er `800` + `g` + `zwarte bonen in
 blik` van maakt. Food Alias, Unit Alias, Never Unit en Food Replace doen
 daarna hun werk, net als bij elk ander recept. De brug ontleedt zelf niets.
 
-Wat er meekomt: titel, beschrijving, porties, bereidingstijd, de
-ingrediëntregels, de stappen, de foto in de grootste maat, en de tips. Die
+Wat er meekomt: titel, beschrijving, porties, bereidingstijd, oven- en
+wachttijd, de ingrediëntregels, de stappen, de foto in de grootste maat, en de tips. Die
 laatste komen als extra stap(pen) ná de echte, met `Tip:` ervoor. Niet in de
 beschrijving: die knipt Tandoor af op 512 tekens, en boven de 256 zet hij hem
 ook nog eens voor stap 1, zodat je hem twee keer leest. Het domein-trefwoord `www.ah.nl` komt er via de
 canonical in, dus Food Replace-regels met een bron-regex vuren ook.
+
+De oven- en wachttijd staan niet bij het recept zelf in de app-API, alleen in
+de zoekresultaten (`recipeSearch` → `time { cook oven wait }`). De brug zoekt
+daarom één keer op de titel en neemt de tijd van het resultaat met hetzelfde
+recept-ID. Oven plus wachten wordt `cookTime`, dus Tandoors wachttijd; de
+bereidingstijd blijft de werktijd. Vindt de zoekvraag het recept niet of
+faalt hij, dan komt het recept gewoon binnen, zonder wachttijd.
 
 Werkt het? Kijk zonder Tandoor erbij:
 
