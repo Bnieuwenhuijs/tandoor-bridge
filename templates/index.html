@@ -270,6 +270,10 @@ const ONDERWEG = ["wachtend", "ophalen", "naar_tandoor"];
 
 let filter = "";
 let timer = null;
+// Hoeveel regels de geschiedenis toont. "Meer tonen" verhoogt dit; een ander
+// filter zet het terug, anders blijft een lange lijst ook daar lang.
+const PER_KEER = 200;
+let tonen = PER_KEER;
 
 const $ = (id) => document.getElementById(id);
 
@@ -403,7 +407,7 @@ function filterknoppen(counts) {
                           : Object.values(counts).reduce((a, b) => a + b, 0);
     const knop = el("button", "chip", `${naam} (${aantal})`);
     knop.setAttribute("aria-pressed", String(filter === waarde));
-    knop.addEventListener("click", () => { filter = waarde; ververs(); });
+    knop.addEventListener("click", () => { filter = waarde; tonen = PER_KEER; ververs(); });
     vak.appendChild(knop);
   }
 }
@@ -452,7 +456,7 @@ function regelvoor(item) {
 async function ververs() {
   let onderweg = 0;
   try {
-    const pad = "/api/items?limit=200" + (filter ? "&status=" + filter : "");
+    const pad = `/api/items?limit=${tonen}` + (filter ? "&status=" + filter : "");
     const data = await vraag(pad);
     if (data.error) { $("statusregel").textContent = data.error; return; }
 
@@ -466,6 +470,16 @@ async function ververs() {
         filter ? "Niets met deze status." : "Nog niets geïmporteerd."));
     } else {
       for (const item of data.items) lijst.appendChild(regelvoor(item));
+    }
+    const totaal = filter ? (counts[filter] || 0)
+                          : Object.values(counts).reduce((a, b) => a + b, 0);
+    if (totaal > data.items.length) {
+      const meer = el("li", "leeg");
+      const knop = el("button", "klein",
+        `Meer tonen (${data.items.length} van ${totaal})`);
+      knop.addEventListener("click", () => { tonen += PER_KEER; ververs(); });
+      meer.appendChild(knop);
+      lijst.appendChild(meer);
     }
 
     $("opnieuwalles").hidden = !counts.mislukt;

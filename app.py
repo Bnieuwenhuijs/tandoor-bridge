@@ -310,7 +310,9 @@ def create_app(*, store=None, client=None, queue=None, start_worker=True,
             limiet = int(request.args.get("limit", 100))
         except (TypeError, ValueError):
             limiet = 100
-        limiet = max(1, min(limiet, 1000))   # een negatieve limiet haalde de grens eruit
+        # Een negatieve limiet haalde de grens eruit. 5000 is ruim genoeg voor
+        # "Meer tonen" in de geschiedenis en houdt één verzoek nog klein.
+        limiet = max(1, min(limiet, 5000))
         sorteerstand = ronde.store.ronde()
         return jsonify({
             "items": [verrijk(i) for i in store.items(status=status, limit=limiet)],
